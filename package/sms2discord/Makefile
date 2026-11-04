@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=sms2discord
-PKG_VERSION:=0.2.0
+PKG_VERSION:=0.3.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -20,7 +20,7 @@ define Package/sms2discord
   CATEGORY:=Utilities
   TITLE:=Two-way SMS to Discord bridge for smstools3
   URL:=https://github.com/koraysels/sms2discord
-  DEPENDS:=+smstools3 +lua +lua-cjson +curl
+  DEPENDS:=+smstools3 +lua +lua-cjson +libuci-lua +curl
   PKGARCH:=all
 endef
 
@@ -28,31 +28,22 @@ define Package/sms2discord/description
   Forwards every SMS received by smstools3 to a Discord channel via a webhook,
   and optionally sends SMS from "!sms <number> <text>" messages in that channel.
   Works on stock OpenWrt and GL.iNet firmware 4.x.
+  Configure with luci-app-sms2discord or "sms2discord setup".
+endef
+
+define Package/sms2discord/conffiles
+/etc/config/sms2discord
 endef
 
 define Build/Compile
 endef
 
 define Package/sms2discord/install
-	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/init.d
+	$(INSTALL_DIR) $(1)/usr/bin $(1)/etc/init.d $(1)/etc/config $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/sms2discord.lua $(1)/usr/bin/sms2discord
 	$(INSTALL_BIN) ./files/sms2discord.init $(1)/etc/init.d/sms2discord
-endef
-
-define Package/sms2discord/postinst
-#!/bin/sh
-[ -n "$${IPKG_INSTROOT}" ] && exit 0
-/etc/init.d/sms2discord enable
-/etc/init.d/sms2discord restart
-exit 0
-endef
-
-define Package/sms2discord/prerm
-#!/bin/sh
-[ -n "$${IPKG_INSTROOT}" ] && exit 0
-/etc/init.d/sms2discord stop
-/etc/init.d/sms2discord disable
-exit 0
+	$(INSTALL_CONF) ./files/sms2discord.config $(1)/etc/config/sms2discord
+	$(INSTALL_BIN) ./files/sms2discord.uci-defaults $(1)/etc/uci-defaults/90-sms2discord
 endef
 
 $(eval $(call BuildPackage,sms2discord))

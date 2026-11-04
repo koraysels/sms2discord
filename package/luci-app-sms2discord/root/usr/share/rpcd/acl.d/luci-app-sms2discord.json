@@ -1,0 +1,20 @@
+{
+	"luci-app-sms2discord": {
+		"description": "Grant access to sms2discord configuration",
+		"read": {
+			"file": {
+				"/usr/bin/sms2discord status --json": [ "exec" ],
+				"/sbin/logread -e sms2discord": [ "exec" ]
+			},
+			"uci": [ "sms2discord" ]
+		},
+		"write": {
+			"file": {
+				"/usr/bin/sms2discord test": [ "exec" ],
+				"/usr/bin/sms2discord detect": [ "exec" ],
+				"/etc/init.d/sms2discord restart": [ "exec" ]
+			},
+			"uci": [ "sms2discord" ]
+		}
+	}
+}

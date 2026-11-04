@@ -1,0 +1,5 @@
+#!/bin/sh
+# keep the secrets readable by root only, and import pre-UCI configs (v0.1/v0.2)
+chmod 600 /etc/config/sms2discord 2>/dev/null
+/usr/bin/sms2discord migrate
+exit 0

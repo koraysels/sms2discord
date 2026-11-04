@@ -1,0 +1,14 @@
+{
+	"admin/services/sms2discord": {
+		"title": "SMS to Discord",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "sms2discord"
+		},
+		"depends": {
+			"acl": [ "luci-app-sms2discord" ],
+			"uci": { "sms2discord": true }
+		}
+	}
+}

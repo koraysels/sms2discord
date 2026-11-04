@@ -4,15 +4,19 @@
 -- Works on OpenWrt with smstools3, including GL.iNet firmware 4.x.
 -- https://github.com/koraysels/sms2discord
 --
--- Usage: sms2discord run|setup|set-bot|status|test|selftest
+-- Usage: sms2discord run|setup|set-bot|detect|migrate|status [--json]|test|selftest
+--
+-- Config: UCI /etc/config/sms2discord (older versions: /etc/sms2discord/config).
 --
 -- Never logs SMS text, phone numbers or secrets.
 
 local cjson = require "cjson"
 
-local VERSION = "0.2.0"
+local VERSION = "0.3.0"
 local CONF_DIR = "/etc/sms2discord"
-local CONF_FILE = CONF_DIR .. "/config"
+local CONF_FILE = "/etc/config/sms2discord"
+local LEGACY_CONF = CONF_DIR .. "/config"
+local UCI_PKG = "sms2discord"
 local SEEN_FILE = CONF_DIR .. "/seen"
 local LASTID_FILE = CONF_DIR .. "/last_id"
 local RUN_DIR = "/tmp/sms2discord"
@@ -249,23 +253,57 @@ end
 
 -- ---------------------------------------------------------------- config
 
+-- internal key -> UCI option in sms2discord.main
+local UCI_MAP = {
+  WEBHOOK_URL = "webhook_url", BOT_TOKEN = "bot_token", CHANNEL_ID = "channel_id",
+  ALLOWED_USER_IDS = "allowed_user", POLL_SMS = "poll_sms", POLL_DISCORD = "poll_discord",
+  OUT_MAX_PER_HOUR = "out_max_per_hour",
+}
+
+local function uci_cursor()
+  local ok, uci = pcall(require, "uci")
+  return ok and uci.cursor() or nil
+end
+
+local function read_legacy()
+  local raw = {}
+  for line in (read_file(LEGACY_CONF) or ""):gmatch("[^\n]+") do
+    local k, v = line:match("^%s*([%u_]+)%s*=%s*(.-)%s*$")
+    if k then raw[k] = v:match('^"(.*)"$') or v:match("^'(.*)'$") or v end
+  end
+  return raw
+end
+
+local function read_raw_config()
+  local cur = uci_cursor()
+  local sec = cur and cur:get_all(UCI_PKG, "main")
+  if not sec then return read_legacy() end
+  local raw = { ENABLED = sec.enabled }
+  for k, opt in pairs(UCI_MAP) do
+    local v = sec[opt]
+    if type(v) == "table" then v = table.concat(v, " ") end
+    raw[k] = v
+  end
+  return raw
+end
+
 local function load_config()
   local c = { POLL_SMS = "2", POLL_DISCORD = "4", OUT_MAX_PER_HOUR = "10" }
-  for line in (read_file(CONF_FILE) or ""):gmatch("[^\n]+") do
-    local k, v = line:match("^%s*([%u_]+)%s*=%s*(.-)%s*$")
-    if k then c[k] = v:match('^"(.*)"$') or v:match("^'(.*)'$") or v end
+  for k, v in pairs(read_raw_config()) do
+    if v ~= "" then c[k] = v end
   end
   local errs = {}
   if not (c.WEBHOOK_URL or ""):match("^https://[%w%.]*discord%.com/api/webhooks/%d+/[%w_%-]+$")
     and not (c.WEBHOOK_URL or ""):match("^https://[%w%.]*discordapp%.com/api/webhooks/%d+/[%w_%-]+$") then
-    errs[#errs + 1] = "WEBHOOK_URL missing or not a Discord webhook URL"
+    errs[#errs + 1] = "webhook_url missing or not a Discord webhook URL"
   end
+  c.enabled = c.ENABLED ~= "0"
   c.allowed = {}
   for id in (c.ALLOWED_USER_IDS or ""):gmatch("%d+") do c.allowed[id] = true end
   c.outbound = (c.BOT_TOKEN or "") ~= "" and (c.CHANNEL_ID or "") ~= "" and next(c.allowed) ~= nil
   if c.outbound then
-    if not c.BOT_TOKEN:match("^[%w%._%-]+$") then errs[#errs + 1] = "BOT_TOKEN has unexpected characters" end
-    if not c.CHANNEL_ID:match("^%d+$") then errs[#errs + 1] = "CHANNEL_ID must be numeric" end
+    if not c.BOT_TOKEN:match("^[%w%._%-]+$") then errs[#errs + 1] = "bot_token has unexpected characters" end
+    if not c.CHANNEL_ID:match("^%d+$") then errs[#errs + 1] = "channel_id must be numeric" end
   end
   c.poll_sms = math.max(1, tonumber(c.POLL_SMS) or 2)
   c.poll_discord = math.max(2, tonumber(c.POLL_DISCORD) or 4)
@@ -627,6 +665,10 @@ local function cmd_run()
     for _, e in ipairs(errs) do log("err", "config: " .. e) end
     os.exit(1)
   end
+  if not c.enabled then
+    log("info", "disabled in " .. CONF_FILE)
+    os.exit(0)
+  end
   local paths
   while true do
     paths = smsd_paths()
@@ -651,13 +693,25 @@ local function cmd_run()
   end
 end
 
-local CONF_KEYS = { "WEBHOOK_URL", "BOT_TOKEN", "CHANNEL_ID", "ALLOWED_USER_IDS", "POLL_SMS", "POLL_DISCORD", "OUT_MAX_PER_HOUR" }
-
 local function save_config(c)
-  os.execute("mkdir -p " .. shq(CONF_DIR) .. " && chmod 700 " .. shq(CONF_DIR))
-  local lines = {}
-  for _, k in ipairs(CONF_KEYS) do lines[#lines + 1] = k .. "=" .. (c[k] or "") end
-  return write_atomic(CONF_FILE, table.concat(lines, "\n") .. "\n", "600")
+  local cur = uci_cursor()
+  if not cur then return nil, "libuci-lua is not installed" end
+  if not exists(CONF_FILE) then write_file(CONF_FILE, "", "600") end
+  cur:set(UCI_PKG, "main", "sms2discord")
+  if not cur:get(UCI_PKG, "main", "enabled") then cur:set(UCI_PKG, "main", "enabled", "1") end
+  for k, opt in pairs(UCI_MAP) do
+    local v = c[k] or ""
+    if opt == "allowed_user" then
+      local ids = {}
+      for id in v:gmatch("%d+") do ids[#ids + 1] = id end
+      if #ids > 0 then cur:set(UCI_PKG, "main", opt, ids) else cur:delete(UCI_PKG, "main", opt) end
+    elseif v ~= "" then
+      cur:set(UCI_PKG, "main", opt, v)
+    else
+      cur:delete(UCI_PKG, "main", opt)
+    end
+  end
+  return cur:commit(UCI_PKG)
 end
 
 -- fill CHANNEL_ID from the webhook and ALLOWED_USER_IDS from the bot's owner
@@ -710,10 +764,38 @@ local function cmd_set_bot()
   if ok then
     print("Saved. Restart with: /etc/init.d/sms2discord restart")
   elseif before then
-    write_atomic(CONF_FILE, before, "600") -- keep the old, working config
+    write_file(CONF_FILE, before, "600") -- keep the old, working config
     print("Not saved; previous config kept.")
   end
   os.exit(ok and 0 or 1)
+end
+
+-- fill in missing IDs from Discord and save (used by LuCI's "Detect" button)
+local function cmd_detect()
+  os.execute("mkdir -p " .. shq(RUN_DIR) .. " && chmod 700 " .. shq(RUN_DIR))
+  local c = load_config()
+  autodetect_ids(c)
+  save_config(c)
+  c = load_config()
+  local code = 0
+  if c.outbound then
+    code = http("GET", API .. "/channels/" .. c.CHANNEL_ID .. "/messages?limit=1", nil, c.BOT_TOKEN)
+  end
+  print(cjson.encode({ channel_id = c.CHANNEL_ID or "", allowed_user = c.ALLOWED_USER_IDS or "",
+    outbound = c.outbound, bot_read_http = code }))
+end
+
+-- move /etc/sms2discord/config (v0.1/v0.2) into UCI
+local function cmd_migrate()
+  if not exists(LEGACY_CONF) then return end
+  local c = load_config()
+  if (c.WEBHOOK_URL or "") == "" then
+    for k, v in pairs(read_legacy()) do if v ~= "" then c[k] = v end end
+    local ok, err = save_config(c)
+    if not ok then io.stderr:write("sms2discord: migration failed: " .. tostring(err) .. "\n") os.exit(1) end
+  end
+  os.remove(LEGACY_CONF)
+  log("info", "migrated " .. LEGACY_CONF .. " to " .. CONF_FILE)
 end
 
 local function prompt(label, secret)
@@ -752,20 +834,35 @@ local function cmd_setup()
   print("Saved " .. CONF_FILE .. ". Restart with: /etc/init.d/sms2discord restart")
 end
 
-local function cmd_status()
+local function cmd_status(as_json)
   local c, errs = load_config()
   local pid = (read_file(LOCK_DIR .. "/pid") or ""):match("%d+")
-  local running = pid ~= nil and exists("/proc/" .. pid .. "/cmdline")
-  print("version:   " .. VERSION)
-  print("service:   " .. (running and "running" or "not running"))
-  print("config:    " .. (exists(CONF_FILE) and "present" or "missing") .. (#errs > 0 and (" (" .. table.concat(errs, "; ") .. ")") or ""))
-  print("webhook:   " .. ((c.WEBHOOK_URL or "") ~= "" and "set (hidden)" or "not set"))
-  print("outbound:  " .. (c.outbound and ("enabled, channel " .. c.CHANNEL_ID) or "disabled"))
   local n = 0
   for _ in (read_file(SEEN_FILE) or ""):gmatch("[^\n]+") do n = n + 1 end
-  print("seen sms:  " .. n .. (exists(SEEN_FILE) and "" or " (not initialised yet)"))
   local p = smsd_paths()
-  print("watching:  " .. (p and table.concat(p.watch, ", ") or "smstools config not found"))
+  local st = {
+    version = VERSION,
+    running = pid ~= nil and exists("/proc/" .. pid .. "/cmdline"),
+    enabled = c.enabled,
+    configured = #errs == 0,
+    errors = table.concat(errs, "; "),
+    webhook_set = (c.WEBHOOK_URL or "") ~= "",
+    bot_set = (c.BOT_TOKEN or "") ~= "",
+    outbound = c.outbound,
+    channel_id = c.CHANNEL_ID or "",
+    allowed_users = c.ALLOWED_USER_IDS or "",
+    seen = n,
+    initialised = exists(SEEN_FILE),
+    watching = p and table.concat(p.watch, " ") or "",
+  }
+  if as_json then print(cjson.encode(st)) return end
+  print("version:   " .. st.version)
+  print("service:   " .. (st.running and "running" or "not running") .. (st.enabled and "" or " (disabled in config)"))
+  print("config:    " .. CONF_FILE .. (st.configured and "" or (" (" .. st.errors .. ")")))
+  print("webhook:   " .. (st.webhook_set and "set (hidden)" or "not set"))
+  print("outbound:  " .. (st.outbound and ("enabled, channel " .. st.channel_id) or "disabled"))
+  print("seen sms:  " .. n .. (st.initialised and "" or " (not initialised yet)"))
+  print("watching:  " .. (st.watching ~= "" and st.watching or "smstools config not found"))
   print("recent log:")
   io.stdout:flush()
   os.execute("logread -e sms2discord 2>/dev/null | tail -n 10")
@@ -824,10 +921,12 @@ local cmd = arg[1]
 if cmd == "run" then cmd_run()
 elseif cmd == "setup" then cmd_setup()
 elseif cmd == "set-bot" then cmd_set_bot()
-elseif cmd == "status" then cmd_status()
+elseif cmd == "status" then cmd_status(arg[2] == "--json")
+elseif cmd == "detect" then cmd_detect()
+elseif cmd == "migrate" then cmd_migrate()
 elseif cmd == "test" then cmd_test()
 elseif cmd == "selftest" then cmd_selftest()
 else
-  print("Usage: sms2discord run|setup|set-bot|status|test|selftest")
+  print("Usage: sms2discord run|setup|set-bot|detect|migrate|status [--json]|test|selftest")
   os.exit(cmd and 1 or 0)
 end
