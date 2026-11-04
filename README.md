@@ -32,7 +32,15 @@ The router never needs inbound access: it only makes outgoing HTTPS requests to 
 
 Two packages, both architecture-independent: `sms2discord` (the service) and `luci-app-sms2discord` (the web UI, optional).
 
-### Option A: opkg (recommended)
+### Option A: GL.iNet Plug-ins page (easiest)
+
+1. **Applications → Plug-ins → Manage Sources**
+2. Name `sms2discord`, URL `https://koraysels.github.io/sms2discord/packages`, click **+**, then **Apply**
+3. **Refresh**, search `sms2discord`, install `sms2discord`, then `luci-app-sms2discord`
+
+The same feed works on stock OpenWrt: add `src/gz sms2discord https://koraysels.github.io/sms2discord/packages` to `/etc/opkg/customfeeds.conf`, then `opkg update && opkg install sms2discord luci-app-sms2discord`. The feed is unsigned. If your opkg has `option check_signature` enabled, use option B instead.
+
+### Option B: download the packages
 
 On the router:
 
@@ -45,7 +53,7 @@ opkg update && opkg install ./sms2discord_all.ipk ./luci-app-sms2discord_all.ipk
 
 On GL.iNet they then also show up under **Applications → Plug-ins**.
 
-### Option B: from a clone, over SSH
+### Option C: from a clone, over SSH
 
 ```bash
 git clone https://github.com/koraysels/sms2discord.git && cd sms2discord
@@ -54,7 +62,7 @@ HOST=root@192.168.8.1 ./install.sh          # --no-luci, --keep-on-upgrade
 
 Builds both packages locally and installs them with opkg (one password prompt).
 
-### Option C: in your own firmware
+### Option D: in your own firmware
 
 `package/` is a regular OpenWrt feed:
 

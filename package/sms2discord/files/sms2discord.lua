@@ -12,7 +12,7 @@
 
 local cjson = require "cjson"
 
-local VERSION = "0.3.0"
+local VERSION = "0.3.1"
 local CONF_DIR = "/etc/sms2discord"
 local CONF_FILE = "/etc/config/sms2discord"
 local LEGACY_CONF = CONF_DIR .. "/config"
@@ -900,11 +900,11 @@ local function cmd_selftest()
   eq("sf_gt same len", sf_gt("1300000000000000001", "1300000000000000000"), true)
   eq("sf_gt equal", sf_gt("5", "5"), false)
   eq("urlenc", urlenc("\226\143\179"), "%E2%8F%B3")
-  local h, b = parse_sms("From: 32470\nFrom_TOA: 91 international\nAlphabet: ISO\n\nCode 1234\n")
-  eq("parse from", h and h.From, "32470")
+  local h, b = parse_sms("From: 15555550100\nFrom_TOA: 91 international\nAlphabet: ISO\n\nCode 1234\n")
+  eq("parse from", h and h.From, "15555550100")
   eq("parse body", b, "Code 1234\n")
   eq("decode iso", decode_body(h, b), "Code 1234")
-  eq("sender intl", display_sender(h), "+32470")
+  eq("sender intl", display_sender(h), "+15555550100")
   eq("sender alpha", display_sender({ From = "itsme", From_TOA = "D0 alphanumeric" }), "itsme")
   local hu, bu = parse_sms("From: x\nAlphabet: UCS2\n\n\0H\0i")
   eq("decode ucs2", decode_body(hu, bu), "Hi")
