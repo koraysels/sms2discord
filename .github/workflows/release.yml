@@ -49,6 +49,8 @@ jobs:
           cp dist/feed/* site/packages/
           cat > site/index.html <<'HTML'
           <!doctype html><meta charset="utf-8"><title>sms2discord opkg feed</title>
+          <link rel="icon" href="favicon.png">
+          <p><img src="logo.png" alt="sms2discord logo" width="160"></p>
           <h1>sms2discord opkg feed</h1>
           <p>Add this source on your router, then install <code>sms2discord</code> and <code>luci-app-sms2discord</code>:</p>
           <pre>https://koraysels.github.io/sms2discord/packages</pre>
@@ -56,6 +58,7 @@ jobs:
           <code>src/gz sms2discord https://koraysels.github.io/sms2discord/packages</code> to <code>/etc/opkg/customfeeds.conf</code>.</p>
           <p><a href="https://github.com/koraysels/sms2discord">Documentation and source</a> · <a href="packages/Packages">Packages</a></p>
           HTML
+          cp docs/logo.png docs/favicon.png site/
 
       - uses: actions/upload-pages-artifact@v3
         if: startsWith(github.ref, 'refs/tags/')

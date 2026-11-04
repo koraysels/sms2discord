@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" alt="sms2discord logo" width="200"></p>
+
 # sms2discord
 
 Two-way SMS ↔ Discord bridge that runs **on the router itself**. Every SMS your router's SIM receives appears in a Discord channel within seconds, and `!sms +15555550100 hello` in that channel sends one back.
