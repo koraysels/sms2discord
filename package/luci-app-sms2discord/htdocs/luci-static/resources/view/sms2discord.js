@@ -57,6 +57,21 @@ function gatewayLogin(token) {
 	});
 }
 
+/* notices that must survive the reload after "Detect" */
+var NOTICE_KEY = 'sms2discord-notice';
+
+function stashNotice(msg, type) {
+	try { sessionStorage.setItem(NOTICE_KEY, JSON.stringify([ msg, type ])); } catch (e) {}
+}
+
+function showStashedNotice() {
+	try {
+		var n = JSON.parse(sessionStorage.getItem(NOTICE_KEY) || 'null');
+		sessionStorage.removeItem(NOTICE_KEY);
+		if (n) ui.addNotification(null, E('p', {}, n[0]), n[1]);
+	} catch (e) {}
+}
+
 function yesNo(v, yes, no) {
 	return E('span', { 'class': 'label ' + (v ? 'success' : 'warning') }, v ? yes : no);
 }
@@ -207,12 +222,10 @@ return view.extend({
 					msg = _('HTTP 401: wrong bot token.');
 				else
 					msg = _('Could not enable sending: %s').format((res.stdout || res.stderr || '').trim());
-				ui.addNotification(null, E('p', {}, msg), r.bot_read_http == 200 ? 'info' : 'warning');
+				stashNotice(msg, r.bot_read_http == 200 ? 'info' : 'warning');
 				return fs.exec('/etc/init.d/sms2discord', [ 'restart' ]);
 			}).then(function() {
-				return uci.unload('sms2discord');
-			}).then(function() {
-				window.setTimeout(function() { location.reload(); }, 1500);
+				location.reload(); // show the detected IDs in the form
 			});
 		};
 
@@ -229,6 +242,8 @@ return view.extend({
 		o.placeholder = '10';
 
 		return m.render().then(function(mapEl) {
+			// LuCI replaces the page content after render(); notify once it's in place
+			window.setTimeout(showStashedNotice, 0);
 			return E([], [ statusSection, mapEl ]);
 		});
 	}

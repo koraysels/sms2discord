@@ -5,10 +5,11 @@ Two-way SMS ↔ Discord bridge that runs **on the router itself**. Every SMS you
 Built for OpenWrt routers with a cellular modem and `smstools3`, tested on a **GL.iNet GL-X2000 (Spitz Plus)** with firmware 4.7. Handy for OTP codes on a SIM that lives in a router.
 
 - Pure Lua + curl (~30 KB), no server, no Docker, no e-mail relay
+- LuCI page to set it up and watch it (status, log, test button)
 - Only **new** SMS are forwarded, never the existing inbox
 - No duplicates, also after a reboot; retries while the internet is down
 - Mentions disabled, markdown escaped, link previews off
-- Secrets stay in `/etc/sms2discord/config` (`chmod 600`) and never appear in logs or on a command line. Logs never contain SMS text or phone numbers.
+- Secrets stay in `/etc/config/sms2discord` (`chmod 600`) and never appear in logs or on a command line. Logs never contain SMS text or phone numbers.
 - Sending is limited to allow-listed Discord users, with a rate limit and ⏳ → ✅/❌ status reactions
 
 ```
@@ -23,68 +24,66 @@ The router never needs inbound access: it only makes outgoing HTTPS requests to 
 
 ## Requirements
 
-- OpenWrt (19.07 or newer) or GL.iNet firmware 4.x with a modem and **smstools3** receiving SMS
-- Packages `lua`, `lua-cjson`, `curl` (pre-installed on GL.iNet 4.x; `opkg` installs them otherwise)
-- A Discord server where you can create a webhook (and optionally a bot)
+- OpenWrt 19.07 or newer, or GL.iNet firmware 4.x, with a modem and **smstools3** receiving SMS
+- `lua`, `lua-cjson`, `libuci-lua`, `curl` (pre-installed on GL.iNet 4.x; `opkg` pulls them in otherwise)
+- For the web UI: LuCI. On GL.iNet: **System → Advanced Settings → Install Now**, LuCI then runs on port 8080.
 
 ## Install
 
-### Option A: opkg package (recommended)
+Two packages, both architecture-independent: `sms2discord` (the service) and `luci-app-sms2discord` (the web UI, optional).
 
-Download the `.ipk` from [Releases](https://github.com/koraysels/sms2discord/releases) and install it on the router:
+### Option A: opkg (recommended)
+
+On the router:
 
 ```bash
 cd /tmp
-wget https://github.com/koraysels/sms2discord/releases/download/v0.2.0/sms2discord_0.2.0-1_all.ipk
-opkg update && opkg install ./sms2discord_0.2.0-1_all.ipk
+base=https://github.com/koraysels/sms2discord/releases/latest/download
+wget "$base/sms2discord_all.ipk" "$base/luci-app-sms2discord_all.ipk"
+opkg update && opkg install ./sms2discord_all.ipk ./luci-app-sms2discord_all.ipk
 ```
 
-On GL.iNet it then also shows up under **Applications → Plug-ins**, where you can uninstall it. One `.ipk` fits every architecture.
+On GL.iNet they then also show up under **Applications → Plug-ins**.
 
-### Option B: copy over SSH from your computer
+### Option B: from a clone, over SSH
 
 ```bash
 git clone https://github.com/koraysels/sms2discord.git && cd sms2discord
-HOST=root@192.168.8.1 ./install.sh                     # add --keep-on-upgrade to survive firmware upgrades
+HOST=root@192.168.8.1 ./install.sh          # --no-luci, --keep-on-upgrade
 ```
 
-### Option C: build into your own firmware
+Builds both packages locally and installs them with opkg (one password prompt).
 
-`package/sms2discord` is a regular OpenWrt feed package:
+### Option C: in your own firmware
+
+`package/` is a regular OpenWrt feed:
 
 ```bash
 echo "src-git sms2discord https://github.com/koraysels/sms2discord.git" >> feeds.conf
-./scripts/feeds update sms2discord && ./scripts/feeds install sms2discord
-make package/sms2discord/compile
+./scripts/feeds update sms2discord && ./scripts/feeds install sms2discord luci-app-sms2discord
+make package/sms2discord/compile package/luci-app-sms2discord/compile
 ```
 
 ## Configure
 
-### 1. Webhook (receiving)
+### In LuCI: Services → SMS to Discord
 
-In Discord: your private channel → **Edit Channel → Integrations → Webhooks → New Webhook → Copy Webhook URL**. Then on the router (input is hidden and stays on the router):
+The page shows live status and the log and has a *Send test message* button.
+
+1. **Receiving:** in Discord, open your private channel → *Edit Channel → Integrations → Webhooks → New Webhook → Copy Webhook URL*. Paste it, then *Save & Apply*. Send an SMS to the router to test it.
+2. **Sending (optional):** create a dedicated bot:
+   1. [Developer Portal](https://discord.com/developers/applications) → *New Application*
+   2. *Bot*: enable **Message Content Intent** and *Reset Token*. Under *Installation*, set *Install Link* to **None**, then turn off *Public Bot*.
+   3. Invite it with `https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot&permissions=68672` (View Channels, Send Messages, Read Message History, Add Reactions), then add it to the private channel under *Edit Channel → Permissions*.
+   4. On the *Sending* tab: paste the token and click **Connect bot**. This is Discord's one-time Gateway login, required before a bot may post over REST, and it runs from your browser. Then *Save & Apply*.
+   5. Click **Detect**: it takes the channel from the webhook, allows the bot's owner (you) as sender, and checks that the bot can read the channel.
+
+### In a terminal
 
 ```bash
-ssh -t root@192.168.8.1 sms2discord setup
-ssh root@192.168.8.1 /etc/init.d/sms2discord restart
+ssh -t root@192.168.8.1 sms2discord setup            # prompts, secrets are typed hidden
+HOST=root@192.168.8.1 tools/setup-bot.sh             # bot only, from your computer (Node 22+)
 ```
-
-Leave the bot token empty (`-`) if you only want to receive. `setup` posts a test message to the channel. Send an SMS to the router to test it.
-
-### 2. Bot (sending, optional)
-
-Use a dedicated bot for this, not one that does other things.
-
-1. [Developer Portal](https://discord.com/developers/applications) → **New Application**
-2. **Bot** → turn on **Message Content Intent**, then **Reset Token** and keep the token at hand
-3. **Installation** → Install Link: **None**, then **Bot** → turn off **Public Bot**
-4. Invite it: `https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot&permissions=68672` (View Channels, Send Messages, Read Message History, Add Reactions)
-5. Private channel → **Edit Channel → Permissions** → add the bot
-6. Connect it from your computer (needs Node 22+):
-   ```bash
-   HOST=root@192.168.8.1 tools/setup-bot.sh
-   ```
-   The token is typed hidden. The script does Discord's one-time Gateway login (required before a bot may post over REST), sends the token to the router over SSH stdin, takes the channel ID from the webhook and allows the bot's owner as sender, checks everything and restarts the service. A failed check leaves the old config untouched.
 
 ## Use
 
@@ -108,35 +107,39 @@ Everyone who can read the channel can read your OTP codes. Keep it private.
 
 | What | Command |
 |------|---------|
-| Status and recent log | `sms2discord status` |
+| Status and recent log | `sms2discord status` (`--json` for scripts) |
 | Send a test message | `sms2discord test` |
 | Follow the log | `logread -f -e sms2discord` |
 | Restart / stop / disable | `/etc/init.d/sms2discord restart` / `stop` / `disable` |
-| Change settings | `sms2discord setup` |
+| Change settings | LuCI, `sms2discord setup`, or `uci` + `/etc/init.d/sms2discord restart` |
+| Fill in channel and owner | `sms2discord detect` |
 | Built-in tests | `sms2discord selftest` |
 
-`/etc/sms2discord/config`:
+Config: UCI `/etc/config/sms2discord` (`chmod 600`, kept on package upgrades), section `main`:
 
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `WEBHOOK_URL` | | Discord webhook for incoming SMS |
-| `BOT_TOKEN` | empty | Bot token; empty disables `!sms` |
-| `CHANNEL_ID` | webhook's channel | Channel the bot reads |
-| `ALLOWED_USER_IDS` | bot owner | Discord user IDs allowed to send (space separated) |
-| `POLL_SMS` | `2` | Seconds between inbox checks |
-| `POLL_DISCORD` | `4` | Seconds between Discord checks |
-| `OUT_MAX_PER_HOUR` | `10` | Outgoing SMS limit |
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `enabled` | `1` | Start the service |
+| `webhook_url` | | Discord webhook for incoming SMS |
+| `bot_token` | empty | Bot token; empty disables `!sms` |
+| `channel_id` | webhook's channel | Channel the bot reads |
+| `allowed_user` (list) | bot owner | Discord user IDs allowed to send |
+| `poll_sms` | `2` | Seconds between inbox checks |
+| `poll_discord` | `4` | Seconds between Discord checks |
+| `out_max_per_hour` | `10` | Outgoing SMS limit |
 
-State: `/etc/sms2discord/seen` (forwarded files) and `last_id` (last Discord message handled).
+State lives in `/etc/sms2discord/`: `seen` (forwarded files) and `last_id` (last Discord message handled). Configs from v0.1/v0.2 (`/etc/sms2discord/config`) are migrated automatically.
+
+`/etc/config` is part of router backups, so a backup contains your webhook URL and bot token. Keep backups private.
 
 ## Uninstall
 
 ```bash
-opkg remove sms2discord          # if installed as a package
-./uninstall.sh                   # if installed with install.sh (add --purge to delete config and secrets)
+opkg remove luci-app-sms2discord sms2discord          # on the router
+HOST=root@192.168.8.1 ./uninstall.sh [--purge]        # or from a clone; --purge deletes config and secrets
 ```
 
-The SMS inbox is never touched. Delete the webhook and bot in Discord afterwards. `/etc/sms2discord/` stays after `opkg remove`; delete it with `rm -rf /etc/sms2discord` to remove the secrets.
+The SMS inbox is never touched. Delete the webhook and bot in Discord afterwards.
 
 ## How it works
 
@@ -150,10 +153,11 @@ The SMS inbox is never touched. Delete the webhook and bot in Discord afterwards
 ## Development
 
 ```
-package/sms2discord/files/sms2discord.lua   daemon + setup/set-bot/status/test/selftest → /usr/bin/sms2discord
-package/sms2discord/files/sms2discord.init  procd service (START=99, after smstools3)   → /etc/init.d/sms2discord
-package/sms2discord/Makefile                OpenWrt feed package
-tools/build-ipk.sh                          build dist/*.ipk without the SDK
+package/sms2discord/files/sms2discord.lua   daemon + CLI                       → /usr/bin/sms2discord
+package/sms2discord/files/sms2discord.init  procd service, restarts on config change → /etc/init.d/sms2discord
+package/sms2discord/files/sms2discord.config default UCI config               → /etc/config/sms2discord
+package/luci-app-sms2discord/               LuCI view, menu entry, rpcd ACL
+tools/build-ipk.sh                          build both dist/*.ipk without the SDK
 tools/setup-bot.sh                          connect the bot (token stays local)
 tools/gateway-identify.mjs                  one-time Gateway login
 install.sh / uninstall.sh                   copy-based install over SSH
@@ -161,7 +165,7 @@ install.sh / uninstall.sh                   copy-based install over SSH
 
 Run the tests on a router: `ssh root@192.168.8.1 'lua - selftest' < package/sms2discord/files/sms2discord.lua`
 
-Releases: push a tag `v<version>` matching `PKG_VERSION` and GitHub Actions attaches the `.ipk`.
+Releases: push a tag `v<version>` matching `PKG_VERSION` and GitHub Actions attaches both `.ipk` files (versioned, plus `*_all.ipk` aliases for `releases/latest/download`).
 
 ## License
 

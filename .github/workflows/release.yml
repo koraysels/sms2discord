@@ -21,11 +21,21 @@ jobs:
 
       - name: Self-test (Lua 5.1, as on OpenWrt)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq lua5.1 lua-cjson
+          sudo apt-get update -qq && sudo apt-get install -y -qq lua5.1 lua-cjson nodejs
           lua5.1 package/sms2discord/files/sms2discord.lua selftest
 
+      - name: Check LuCI files
+        run: |
+          node --check package/luci-app-sms2discord/htdocs/luci-static/resources/view/sms2discord.js
+          for f in package/luci-app-sms2discord/root/usr/share/*/*.d/*.json; do python3 -m json.tool "$f" >/dev/null; done
+          [ "$(sed -n 's/^PKG_VERSION:=//p' package/sms2discord/Makefile)" = "$(sed -n 's/^PKG_VERSION:=//p' package/luci-app-sms2discord/Makefile)" ]
+
       - name: Build ipk
-        run: tools/build-ipk.sh
+        run: |
+          tools/build-ipk.sh
+          # stable names for releases/latest/download/<name>
+          cp dist/sms2discord_*-*_all.ipk dist/sms2discord_all.ipk
+          cp dist/luci-app-sms2discord_*-*_all.ipk dist/luci-app-sms2discord_all.ipk
 
       - uses: actions/upload-artifact@v4
         with:

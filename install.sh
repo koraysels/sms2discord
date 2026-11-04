@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Install or update sms2discord on a GL.iNet router over SSH.
+# Build the packages and install them on a router over SSH.
 #
 #   ./install.sh                      # root@192.168.8.1 (GL.iNet default)
 #   HOST=root@10.0.0.1 ./install.sh
-#   SSH_CONTROL=~/.ssh/my-socket ./install.sh     # reuse a specific SSH master socket
-#   ./install.sh --keep-on-upgrade    # also keep files across firmware upgrades
+#   ./install.sh --no-luci            # daemon only
+#   ./install.sh --keep-on-upgrade    # also keep the files across firmware upgrades
+#   ./install.sh --reinstall          # reinstall even if the version didn't change
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -12,38 +13,47 @@ HOST="${HOST:-root@192.168.8.1}"
 # one password prompt per run: the first connection becomes a shared master
 SSH=(ssh -o LogLevel=ERROR -o ControlMaster=auto -o ControlPersist=60
 	-o "ControlPath=${SSH_CONTROL:-$HOME/.ssh/cm-%r@%h:%p}")
-KEEP=0
-[ "${1:-}" = "--keep-on-upgrade" ] && KEEP=1
+LUCI=1 KEEP=0 OPKG="opkg install"
+for a in "$@"; do
+	case "$a" in
+		--no-luci) LUCI=0 ;;
+		--keep-on-upgrade) KEEP=1 ;;
+		--reinstall) OPKG="opkg install --force-reinstall" ;;
+		*) echo "unknown option: $a" >&2; exit 2 ;;
+	esac
+done
 
-put() { # put <local> <remote> <mode>  (no scp: dropbear has no sftp-server)
-	"${SSH[@]}" "$HOST" "cat > '$2.new' && chmod $3 '$2.new' && mv '$2.new' '$2'" < "$1"
-}
+echo "==> building packages"
+pkgs=$(tools/build-ipk.sh)
+[ "$LUCI" = 1 ] || pkgs=$(echo "$pkgs" | grep -v luci-app)
 
 echo "==> checking router"
-"${SSH[@]}" "$HOST" 'test -x /usr/bin/smsd && { test -f /tmp/smstools.cfg || test -f /etc/smsd.conf; } && lua -e "require \"cjson\"" && command -v curl >/dev/null' \
-	|| { echo "router is missing smsd, smstools config, lua-cjson or curl" >&2; exit 1; }
+"${SSH[@]}" "$HOST" 'test -x /usr/bin/smsd && { test -f /tmp/smstools.cfg || test -f /etc/smsd.conf; }' \
+	|| { echo "router has no smstools3 (smsd) set up" >&2; exit 1; }
 
 echo "==> self-test"
 "${SSH[@]}" "$HOST" 'lua - selftest' < package/sms2discord/files/sms2discord.lua
 
-echo "==> copying files"
-"${SSH[@]}" "$HOST" 'mkdir -p /etc/sms2discord && chmod 700 /etc/sms2discord'
-put package/sms2discord/files/sms2discord.lua /usr/bin/sms2discord 755
-put package/sms2discord/files/sms2discord.init /etc/init.d/sms2discord 755
+echo "==> installing"
+remote=()
+for p in $pkgs; do # daemon first: the LuCI app depends on it
+	"${SSH[@]}" "$HOST" "cat > '/tmp/$(basename "$p")'" < "$p"
+	remote+=("/tmp/$(basename "$p")")
+done
+"${SSH[@]}" "$HOST" "$OPKG ${remote[*]} || { opkg update && $OPKG ${remote[*]}; }; rm -f ${remote[*]}"
 
 if [ "$KEEP" = 1 ]; then
 	echo "==> adding to /etc/sysupgrade.conf"
-	"${SSH[@]}" "$HOST" 'for f in /etc/sms2discord/ /usr/bin/sms2discord /etc/init.d/sms2discord; do grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf; done'
+	"${SSH[@]}" "$HOST" 'for f in /etc/sms2discord/ /usr/bin/sms2discord /etc/init.d/sms2discord \
+		/www/luci-static/resources/view/sms2discord.js /usr/share/luci/menu.d/luci-app-sms2discord.json \
+		/usr/share/rpcd/acl.d/luci-app-sms2discord.json; do
+		[ -e "$f" ] && { grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf; }; done'
 fi
-
-echo "==> enabling service"
-"${SSH[@]}" "$HOST" '/etc/init.d/sms2discord enable; if [ -s /etc/sms2discord/config ]; then /etc/init.d/sms2discord restart; echo started; else echo "not configured yet"; fi'
 
 cat <<MSG
 
-Done. If not configured yet, run in your own terminal (input stays local):
+Done. Configure in LuCI (Services → SMS to Discord) or in a terminal:
   ssh -t $HOST sms2discord setup
-  ssh $HOST /etc/init.d/sms2discord restart
 Status:
   ssh $HOST sms2discord status
 MSG
