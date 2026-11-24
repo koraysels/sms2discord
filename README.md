@@ -2,7 +2,7 @@
 
 # sms2discord
 
-Two-way SMS ↔ Discord bridge that runs **on the router itself**. Every SMS your router's SIM receives appears in a Discord channel within seconds, and `!sms +15555550100 hello` in that channel sends one back.
+Two-way SMS ↔ Discord bridge that runs **on the router itself**. Every SMS your router's SIM receives appears in a Discord channel within seconds, and `!sms +15555550100 hello` in that channel sends one back. `!otp NAME` answers with an authenticator (TOTP) code for shared accounts that allow only one authenticator app.
 
 Built for OpenWrt routers with a cellular modem and `smstools3`, tested on a **GL.iNet GL-X2000 (Spitz Plus)** with firmware 4.7. Handy for OTP codes on a SIM that lives in a router.
 
@@ -13,6 +13,7 @@ Built for OpenWrt routers with a cellular modem and `smstools3`, tested on a **G
 - Mentions disabled, markdown escaped, link previews off
 - Secrets stay in `/etc/config/sms2discord` (`chmod 600`) and never appear in logs or on a command line. Logs never contain SMS text or phone numbers.
 - Sending is limited to allow-listed Discord users, with a rate limit and ⏳ → ✅/❌ status reactions
+- Authenticator codes (RFC 6238 TOTP, pure Lua, no extra packages); the bot deletes each code once it has expired
 
 ```
 modem ─▶ smsd ─▶ /etc/spool/sms/incoming/…   sms2discord polls every 2 s ─▶ Discord webhook ─▶ #sms
@@ -113,6 +114,27 @@ Numbers with country code (`+15555550100`) or national format, no spaces. Max 45
 
 Everyone who can read the channel can read your OTP codes. Keep it private.
 
+### Authenticator codes
+
+For accounts your team shares that allow only one authenticator app. Add each account once in LuCI (**Services → SMS to Discord → Authenticator → Add account**) with a short name and its secret key or `otpauth://totp/…` link. To get the secret, choose *can't scan the QR code?* while setting up 2FA in that service. If the account already uses an authenticator app, you usually have to turn 2FA off and on again to see the secret. Then, in the channel:
+
+```
+!otp meta
+```
+
+```
+🔐 meta  123456  valid 18 s
+deletes itself in 33 s
+```
+
+- Only allow-listed users can ask for a code; `!otp` alone lists the names (never codes).
+- With less than 10 s left, the reply also shows the next code.
+- The bot deletes its reply 15 s after the code expires. The secret never goes through Discord, and codes are never logged.
+- SHA1 only (what nearly every service uses), 6–8 digits, any period.
+- Codes depend on the router clock; if NTP has not synced yet, the bot refuses instead of giving wrong codes.
+
+Anyone who can read the channel and knows the password can log in, so turn on 2FA for the Discord accounts in that channel. Some services forbid sharing an account in their terms; that is your call.
+
 ## Manage (on the router)
 
 | What | Command |
@@ -123,6 +145,7 @@ Everyone who can read the channel can read your OTP codes. Keep it private.
 | Restart / stop / disable | `/etc/init.d/sms2discord restart` / `stop` / `disable` |
 | Change settings | LuCI, `sms2discord setup`, or `uci` + `/etc/init.d/sms2discord restart` |
 | Fill in channel and owner | `sms2discord detect` |
+| Current code, locally | `sms2discord otp NAME` |
 | Built-in tests | `sms2discord selftest` |
 
 Config: UCI `/etc/config/sms2discord` (`chmod 600`, kept on package upgrades), section `main`:
@@ -138,9 +161,18 @@ Config: UCI `/etc/config/sms2discord` (`chmod 600`, kept on package upgrades), s
 | `poll_discord` | `4` | Seconds between Discord checks |
 | `out_max_per_hour` | `10` | Outgoing SMS limit |
 
+Authenticator accounts are `otp` sections:
+
+```
+config otp
+	option name 'meta'
+	option secret 'otpauth://totp/Meta:team?secret=JBSWY3DPEHPK3PXP'
+	option enabled '1'
+```
+
 State lives in `/etc/sms2discord/`: `seen` (forwarded files) and `last_id` (last Discord message handled). Configs from v0.1/v0.2 (`/etc/sms2discord/config`) are migrated automatically.
 
-`/etc/config` is part of router backups, so a backup contains your webhook URL and bot token. Keep backups private.
+`/etc/config` is part of router backups, so a backup contains your webhook URL, bot token and authenticator secrets. Keep backups private.
 
 ## Uninstall
 

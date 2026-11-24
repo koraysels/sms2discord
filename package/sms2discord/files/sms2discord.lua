@@ -1,18 +1,19 @@
 #!/usr/bin/lua
 -- sms2discord: forward incoming SMS from the smstools3 spool to a Discord
--- webhook, and optionally send SMS from "!sms" commands in Discord.
+-- webhook, and optionally send SMS from "!sms" commands in Discord and
+-- answer "!otp NAME" with an authenticator (TOTP) code.
 -- Works on OpenWrt with smstools3, including GL.iNet firmware 4.x.
 -- https://github.com/koraysels/sms2discord
 --
--- Usage: sms2discord run|setup|set-bot|detect|migrate|status [--json]|test|selftest
+-- Usage: sms2discord run|setup|set-bot|detect|migrate|status [--json]|test|otp NAME|selftest
 --
 -- Config: UCI /etc/config/sms2discord (older versions: /etc/sms2discord/config).
 --
--- Never logs SMS text, phone numbers or secrets.
+-- Never logs SMS text, phone numbers, OTP codes or secrets.
 
 local cjson = require "cjson"
 
-local VERSION = "0.3.1"
+local VERSION = "0.4.0"
 local CONF_DIR = "/etc/sms2discord"
 local CONF_FILE = "/etc/config/sms2discord"
 local LEGACY_CONF = CONF_DIR .. "/config"
@@ -21,6 +22,7 @@ local SEEN_FILE = CONF_DIR .. "/seen"
 local LASTID_FILE = CONF_DIR .. "/last_id"
 local RUN_DIR = "/tmp/sms2discord"
 local LOCK_DIR = RUN_DIR .. "/lock"
+local OTP_PENDING = RUN_DIR .. "/otp_pending" -- code replies still to delete
 -- GL.iNet generates its live config in /tmp; stock OpenWrt uses /etc/smsd.conf
 local SMSD_CFGS = { "/tmp/smstools.cfg", "/etc/smsd.conf" }
 local API = "https://discord.com/api/v10"
@@ -28,6 +30,8 @@ local API = "https://discord.com/api/v10"
 local MAX_DISCORD_CHARS = 1990
 local MAX_SMS_CHARS = 459 -- 3 concatenated GSM-7 parts (smsd autosplit = 3)
 local TRACK_SECONDS = 900
+local OTP_GRACE = 15 -- keep a code visible this long after it expires
+local CLOCK_MIN = 1700000000 -- before this the router clock is not synced
 
 -- ---------------------------------------------------------------- helpers
 
@@ -251,6 +255,125 @@ local function format_inbound(h, text)
   return msg
 end
 
+-- ---------------------------------------------------------------- totp
+
+-- Pure Lua 5.1 (no bit library on stock OpenWrt): 32-bit unsigned ops by
+-- arithmetic. Only used for a few HMAC blocks per !otp, so speed is fine.
+local TWO32 = 4294967296
+
+local function bitop(a, b, keep)
+  local r, p = 0, 1
+  while a > 0 or b > 0 do
+    local x, y = a % 2, b % 2
+    if keep(x + y) then r = r + p end
+    a, b, p = (a - x) / 2, (b - y) / 2, p * 2
+  end
+  return r
+end
+
+local function band(a, b) return bitop(a, b, function(n) return n == 2 end) end
+local function bor(a, b) return bitop(a, b, function(n) return n > 0 end) end
+local function bxor(a, b) return bitop(a, b, function(n) return n == 1 end) end
+local function bnot(a) return TWO32 - 1 - a end
+local function rol(a, n) return (a * 2 ^ n) % TWO32 + math.floor(a / 2 ^ (32 - n)) end
+
+local function be_bytes(n, len)
+  local t = {}
+  for i = len - 1, 0, -1 do t[#t + 1] = string.char(math.floor(n / 2 ^ (8 * i)) % 256) end
+  return table.concat(t)
+end
+
+local function sha1(msg)
+  local h = { 1732584193, 4023233417, 2562383102, 271733878, 3285377520 }
+  local ml = #msg * 8
+  msg = msg .. "\128" .. string.rep("\0", (55 - #msg) % 64) .. be_bytes(ml, 8)
+  for blk = 1, #msg, 64 do
+    local w = {}
+    for i = 0, 15 do
+      local a, b, c, d = msg:byte(blk + i * 4, blk + i * 4 + 3)
+      w[i] = ((a * 256 + b) * 256 + c) * 256 + d
+    end
+    for i = 16, 79 do w[i] = rol(bxor(bxor(w[i - 3], w[i - 8]), bxor(w[i - 14], w[i - 16])), 1) end
+    local a, b, c, d, e = h[1], h[2], h[3], h[4], h[5]
+    for i = 0, 79 do
+      local f, k
+      if i < 20 then f, k = bor(band(b, c), band(bnot(b), d)), 1518500249
+      elseif i < 40 then f, k = bxor(bxor(b, c), d), 1859775393
+      elseif i < 60 then f, k = bor(bor(band(b, c), band(b, d)), band(c, d)), 2400959708
+      else f, k = bxor(bxor(b, c), d), 3395469782 end
+      a, b, c, d, e = (rol(a, 5) + f + e + k + w[i]) % TWO32, a, rol(b, 30), c, d
+    end
+    for i, v in ipairs({ a, b, c, d, e }) do h[i] = (h[i] + v) % TWO32 end
+  end
+  local out = {}
+  for i = 1, 5 do out[i] = be_bytes(h[i], 4) end
+  return table.concat(out)
+end
+
+local function hmac_sha1(key, msg)
+  if #key > 64 then key = sha1(key) end
+  key = key .. string.rep("\0", 64 - #key)
+  local ipad, opad = {}, {}
+  for i = 1, 64 do
+    local k = key:byte(i)
+    ipad[i] = string.char(bxor(k, 54))
+    opad[i] = string.char(bxor(k, 92))
+  end
+  return sha1(table.concat(opad) .. sha1(table.concat(ipad) .. msg))
+end
+
+-- RFC 6238 with SHA1 (what nearly every service uses)
+local function totp(key, t, digits, period)
+  local h = hmac_sha1(key, be_bytes(math.floor(t / period), 8))
+  local off = h:byte(20) % 16
+  local a, b, c, d = h:byte(off + 1, off + 4)
+  local bin = (((a % 128) * 256 + b) * 256 + c) * 256 + d
+  return string.format("%0" .. digits .. "d", bin % 10 ^ digits)
+end
+
+local B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+local function base32_decode(s)
+  s = s:upper():gsub("[%s%-]", ""):gsub("=+$", "")
+  if s == "" or s:find("[^A-Z2-7]") then return nil end
+  local bits, nbits, out = 0, 0, {}
+  for i = 1, #s do
+    bits = bits * 32 + B32:find(s:sub(i, i), 1, true) - 1
+    nbits = nbits + 5
+    if nbits >= 8 then
+      nbits = nbits - 8
+      out[#out + 1] = string.char(math.floor(bits / 2 ^ nbits))
+      bits = bits % 2 ^ nbits
+    end
+  end
+  return table.concat(out)
+end
+
+local function urldec(s)
+  return (s:gsub("+", " "):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+-- accepts a bare base32 secret or an otpauth://totp/... link from a QR code
+local function parse_otp_secret(s)
+  s = (s or ""):match("^%s*(.-)%s*$")
+  local e = { digits = 6, period = 30 }
+  local secret = s
+  if s:lower():match("^otpauth://") then
+    if (s:match("^%a+://(%a+)/") or ""):lower() ~= "totp" then return nil, "only otpauth://totp links are supported" end
+    local q = {}
+    for k, v in (s:match("%?(.*)$") or ""):gmatch("([^&=]+)=([^&]*)") do q[k:lower()] = urldec(v) end
+    if q.algorithm and q.algorithm:upper() ~= "SHA1" then return nil, "only SHA1 is supported, not " .. q.algorithm end
+    e.digits = tonumber(q.digits or 6)
+    e.period = tonumber(q.period or 30)
+    secret = q.secret or ""
+  end
+  if not (e.digits and e.digits >= 6 and e.digits <= 8 and e.digits % 1 == 0) then return nil, "digits must be 6, 7 or 8" end
+  if not (e.period and e.period >= 10 and e.period <= 300 and e.period % 1 == 0) then return nil, "period must be 10-300 s" end
+  e.key = base32_decode(secret)
+  if not e.key or #e.key < 5 then return nil, "secret is not valid base32" end
+  return e
+end
+
 -- ---------------------------------------------------------------- config
 
 -- internal key -> UCI option in sms2discord.main
@@ -287,6 +410,29 @@ local function read_raw_config()
   return raw
 end
 
+-- "config otp" sections: name + secret. A bad entry is skipped, never fatal.
+local function load_otp(c)
+  c.otp, c.otp_names, c.otp_errs = {}, {}, {}
+  local cur = uci_cursor()
+  if not cur then return end
+  cur:foreach(UCI_PKG, "otp", function(sec)
+    if sec.enabled == "0" then return end
+    local name = (sec.name or ""):lower()
+    if not name:match("^[%w][%w_%.%-]*$") or #name > 32 then
+      c.otp_errs[#c.otp_errs + 1] = "otp entry with invalid name skipped"
+      return
+    end
+    local e, err = parse_otp_secret(sec.secret)
+    if not e then
+      c.otp_errs[#c.otp_errs + 1] = "otp '" .. name .. "': " .. err
+    elseif not c.otp[name] then
+      c.otp[name] = e
+      c.otp_names[#c.otp_names + 1] = name
+    end
+  end)
+  table.sort(c.otp_names)
+end
+
 local function load_config()
   local c = { POLL_SMS = "2", POLL_DISCORD = "4", OUT_MAX_PER_HOUR = "10" }
   for k, v in pairs(read_raw_config()) do
@@ -308,6 +454,7 @@ local function load_config()
   c.poll_sms = math.max(1, tonumber(c.POLL_SMS) or 2)
   c.poll_discord = math.max(2, tonumber(c.POLL_DISCORD) or 4)
   c.out_max = tonumber(c.OUT_MAX_PER_HOUR) or 10
+  load_otp(c)
   return c, errs
 end
 
@@ -502,7 +649,7 @@ end
 
 -- ---------------------------------------------------------------- outbound
 
-local Outbound = { last_id = nil, next_try = 0, sent_times = {}, tracking = {}, warned = false }
+local Outbound = { last_id = nil, next_try = 0, sent_times = {}, tracking = {}, warned = false, expiring = nil }
 
 local function queue_sms(paths, num, text)
   local toa = num:sub(1, 1) == "+" and "international" or "National"
@@ -522,17 +669,80 @@ function Outbound.save()
   write_atomic(LASTID_FILE, Outbound.last_id .. "\n", "600")
 end
 
+-- ---------------------------------------------------------------- !otp
+
+function Outbound.save_expiring()
+  local t = {}
+  for _, x in ipairs(Outbound.expiring) do t[#t + 1] = x.id .. " " .. x.at end
+  write_atomic(OTP_PENDING, table.concat(t, "\n") .. "\n", "600")
+end
+
+function Outbound.otp(c, mid, content, now)
+  local name = (content:match("^!otp%s+(%S+)") or ""):lower()
+  local list = #c.otp_names > 0 and ("`" .. table.concat(c.otp_names, "`, `") .. "`") or nil
+  if not list then
+    bot_reply(c, mid, "No authenticator accounts set up. Add them in LuCI: Services \226\134\146 SMS to Discord \226\134\146 Authenticator.")
+    return
+  end
+  local e = c.otp[name]
+  if not e then
+    bot_reply(c, mid, (name == "" and "Usage: `!otp NAME`" or "Unknown name.") .. " Available: " .. list)
+    return
+  end
+  if now < CLOCK_MIN then
+    bot_reply(c, mid, E_FAIL .. " The router clock is not set yet (NTP), so codes would be wrong.")
+    log("warning", "otp refused: router clock not synced")
+    return
+  end
+  local left = e.period - now % e.period
+  local text = "\240\159\148\144 **" .. name .. "**  `" .. totp(e.key, now, e.digits, e.period) .. "`  valid " .. left .. " s"
+  local life = left
+  if left < 10 then
+    text = text .. "\nnext  `" .. totp(e.key, now + e.period, e.digits, e.period) .. "`  from " .. left .. " s"
+    life = life + e.period
+  end
+  life = life + OTP_GRACE
+  local code, resp = bot_reply(c, mid, text .. "\n-# deletes itself in " .. life .. " s")
+  local ok, j = pcall(cjson.decode, resp)
+  if code >= 200 and code < 300 and ok and type(j) == "table" and j.id then
+    Outbound.expiring[#Outbound.expiring + 1] = { id = tostring(j.id), at = now + life }
+    Outbound.save_expiring()
+  end
+  log("info", "otp code sent for '" .. name .. "'")
+end
+
+function Outbound.expire(c, now)
+  local keep, changed = {}, false
+  for _, x in ipairs(Outbound.expiring) do
+    local code = 0
+    if now >= x.at then
+      code = http("DELETE", API .. "/channels/" .. c.CHANNEL_ID .. "/messages/" .. x.id, nil, c.BOT_TOKEN)
+    end
+    -- 404: already deleted by hand; retry later on rate limit or network trouble
+    if code == 204 or code == 404 or code == 403 or (now > x.at + 3600) then
+      changed = true
+      if code == 403 then log("warning", "cannot delete otp reply (HTTP 403)") end
+    else
+      keep[#keep + 1] = x
+    end
+  end
+  Outbound.expiring = keep
+  if changed then Outbound.save_expiring() end
+end
+
 function Outbound.handle(c, paths, m, now)
   if m.webhook_id or (m.author and m.author.bot) then return end
   local content = (m.content or ""):gsub("\r", "")
-  if not content:match("^!sms") then return end
+  local cmd = content:match("^!(%a+)")
+  if cmd ~= "sms" and cmd ~= "otp" then return end
   local mid = tostring(m.id)
   local uid = m.author and tostring(m.author.id) or ""
   if not c.allowed[uid] then
     bot_react(c, mid, E_BLOCK)
-    log("warning", "ignored !sms from a user not in ALLOWED_USER_IDS")
+    log("warning", "ignored !" .. cmd .. " from a user not in ALLOWED_USER_IDS")
     return
   end
+  if cmd == "otp" then return Outbound.otp(c, mid, content, now) end
   local num, text = content:match("^!sms%s+(%+?%d+)%s+(.+)$")
   if not num or #num < 3 or #num > 16 then
     bot_reply(c, mid, "Usage: `!sms +15555550100 your message`")
@@ -585,6 +795,14 @@ end
 
 function Outbound.tick(c, paths, now)
   if #Outbound.tracking > 0 then Outbound.track(c, paths, now) end
+  if not Outbound.expiring then
+    -- survives a service restart (not a reboot), so old codes still get deleted
+    Outbound.expiring = {}
+    for id, at in (read_file(OTP_PENDING) or ""):gmatch("(%d+) (%d+)") do
+      Outbound.expiring[#Outbound.expiring + 1] = { id = id, at = tonumber(at) }
+    end
+  end
+  if #Outbound.expiring > 0 then Outbound.expire(c, now) end
   if now < Outbound.next_try then return end
   local base = API .. "/channels/" .. c.CHANNEL_ID .. "/messages"
 
@@ -676,7 +894,9 @@ local function cmd_run()
     sleep(10) -- smstools3 writes its config at start-up
   end
   Inbound.init(paths)
-  log("info", "started v" .. VERSION .. (c.outbound and " (inbound + outbound)" or " (inbound only)"))
+  log("info", "started v" .. VERSION .. (c.outbound and " (inbound + outbound)" or " (inbound only)")
+    .. (#c.otp_names > 0 and (", " .. #c.otp_names .. " authenticator account(s)") or ""))
+  for _, e in ipairs(c.otp_errs) do log("warning", "config: " .. e) end
 
   local next_sms, next_discord = 0, 0
   while true do
@@ -854,6 +1074,9 @@ local function cmd_status(as_json)
     seen = n,
     initialised = exists(SEEN_FILE),
     watching = p and table.concat(p.watch, " ") or "",
+    otp_names = table.concat(c.otp_names, " "),
+    otp_errors = table.concat(c.otp_errs, "; "),
+    clock_ok = os.time() >= CLOCK_MIN,
   }
   if as_json then print(cjson.encode(st)) return end
   print("version:   " .. st.version)
@@ -861,6 +1084,8 @@ local function cmd_status(as_json)
   print("config:    " .. CONF_FILE .. (st.configured and "" or (" (" .. st.errors .. ")")))
   print("webhook:   " .. (st.webhook_set and "set (hidden)" or "not set"))
   print("outbound:  " .. (st.outbound and ("enabled, channel " .. st.channel_id) or "disabled"))
+  print("otp:       " .. (#c.otp_names > 0 and table.concat(c.otp_names, ", ") or "none")
+    .. (st.otp_errors ~= "" and (" (" .. st.otp_errors .. ")") or ""))
   print("seen sms:  " .. n .. (st.initialised and "" or " (not initialised yet)"))
   print("watching:  " .. (st.watching ~= "" and st.watching or "smstools config not found"))
   print("recent log:")
@@ -875,6 +1100,18 @@ local function cmd_test()
   local code = post_webhook(c, "\240\159\167\170 sms2discord test message (" .. os.date("%Y-%m-%d %H:%M:%S") .. ")")
   print("Webhook: HTTP " .. code)
   os.exit((code >= 200 and code < 300) and 0 or 1)
+end
+
+local function cmd_otp(name)
+  local c = load_config()
+  local e = c.otp[(name or ""):lower()]
+  if not e then
+    print("Unknown name. Available: " .. (#c.otp_names > 0 and table.concat(c.otp_names, ", ") or "none"))
+    os.exit(1)
+  end
+  local now = os.time()
+  if now < CLOCK_MIN then print("Router clock is not set (NTP).") os.exit(1) end
+  print(totp(e.key, now, e.digits, e.period) .. "  (valid " .. (e.period - now % e.period) .. " s)")
 end
 
 local function cmd_selftest()
@@ -913,6 +1150,35 @@ local function cmd_selftest()
   local ok, back = pcall(cjson.decode, json)
   eq("json roundtrip", ok and back.content, 'a "q" \\ \n </x>')
   eq("json parse array", ok and type(back.allowed_mentions.parse), "table")
+  local function hex(s) return (s:gsub(".", function(ch) return string.format("%02x", ch:byte()) end)) end
+  eq("sha1 empty", hex(sha1("")), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+  eq("sha1 abc", hex(sha1("abc")), "a9993e364706816aba3e25717850c26c9cd0d89d")
+  eq("sha1 2 blocks", hex(sha1("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+    "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+  eq("hmac rfc2202", hex(hmac_sha1(string.rep("\11", 20), "Hi There")), "b617318655057264e28bc0b6fb378c8ef146be00")
+  eq("hmac long key", hex(hmac_sha1(string.rep("\170", 80), "Test Using Larger Than Block-Size Key - Hash Key First")),
+    "aa4ae5e15272d00e95705637ce8a3b55ed402112")
+  local rk = "12345678901234567890"
+  eq("base32", base32_decode("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"), rk)
+  eq("base32 spaced lower", base32_decode("gezd gnbv gy3t qojq gezd gnbv gy3t qojq"), rk)
+  eq("base32 invalid", base32_decode("ABC1"), nil)
+  -- RFC 6238 appendix B (SHA1) and RFC 4226 appendix D
+  for _, v in ipairs({ { 59, "94287082" }, { 1111111109, "07081804" }, { 1111111111, "14050471" },
+    { 1234567890, "89005924" }, { 2000000000, "69279037" }, { 20000000000, "65353130" } }) do
+    eq("totp " .. v[1], totp(rk, v[1], 8, 30), v[2])
+  end
+  eq("hotp 0", totp(rk, 0, 6, 30), "755224")
+  eq("hotp 9", totp(rk, 9 * 30, 6, 30), "520489")
+  local e = parse_otp_secret("otpauth://totp/Acme:me%40x.org?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Acme&digits=8&period=60")
+  eq("otpauth key", e and e.key, rk)
+  eq("otpauth digits", e and e.digits, 8)
+  eq("otpauth period", e and e.period, 60)
+  eq("bare secret", (parse_otp_secret(" JBSWY3DPEHPK3PXP ") or {}).digits, 6)
+  eq("reject sha256", select(2, parse_otp_secret("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&algorithm=SHA256")),
+    "only SHA1 is supported, not SHA256")
+  eq("reject hotp", select(2, parse_otp_secret("otpauth://hotp/x?secret=JBSWY3DPEHPK3PXP&counter=1")),
+    "only otpauth://totp links are supported")
+  eq("reject junk", select(2, parse_otp_secret("not a secret!")), "secret is not valid base32")
   print(fails == 0 and "selftest OK" or ("selftest: " .. fails .. " failure(s)"))
   os.exit(fails == 0 and 0 or 1)
 end
@@ -925,8 +1191,9 @@ elseif cmd == "status" then cmd_status(arg[2] == "--json")
 elseif cmd == "detect" then cmd_detect()
 elseif cmd == "migrate" then cmd_migrate()
 elseif cmd == "test" then cmd_test()
+elseif cmd == "otp" then cmd_otp(arg[2])
 elseif cmd == "selftest" then cmd_selftest()
 else
-  print("Usage: sms2discord run|setup|set-bot|detect|migrate|status [--json]|test|selftest")
+  print("Usage: sms2discord run|setup|set-bot|detect|migrate|status [--json]|test|otp NAME|selftest")
   os.exit(cmd and 1 or 0)
 end

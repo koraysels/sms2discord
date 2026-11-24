@@ -9,6 +9,8 @@
 
 var BIN = '/usr/bin/sms2discord';
 var WEBHOOK_RE = /^https:\/\/([a-z]+\.)?discord(app)?\.com\/api\/webhooks\/\d+\/[\w-]+$/;
+var OTP_NAME_RE = /^[A-Za-z0-9][\w.-]{0,31}$/;
+var OTP_SECRET_RE = /^(otpauth:\/\/totp\/\S+|[A-Za-z2-7=\s-]{8,})$/i;
 
 function getStatus() {
 	return fs.exec(BIN, [ 'status', '--json' ]).then(function(res) {
@@ -101,6 +103,11 @@ return view.extend({
 			row(_('Sending (!sms)'), st.outbound
 				? yesNo(true, _('Enabled in channel %s').format(st.channel_id), '')
 				: yesNo(false, '', st.bot_set ? _('Bot token set; channel or allowed users missing') : _('Off'))),
+			row(_('Authenticator (!otp)'), st.otp_names
+				? E([], [ yesNo(st.outbound, st.otp_names.split(' ').join(', '), _('Needs the bot (Sending tab)')),
+					st.clock_ok ? '' : [ ' ', yesNo(false, '', _('Router clock not synced')) ],
+					st.otp_errors ? [ ' ', E('em', {}, st.otp_errors) ] : '' ])
+				: (st.otp_errors ? E('em', {}, st.otp_errors) : yesNo(false, '', _('No accounts')))),
 			row(_('Forwarded SMS'), st.initialised ? String(st.seen) : _('Not started yet (existing inbox is skipped on first start)')),
 			row(_('Watching'), E('code', {}, st.watching || _('smstools3 config not found')))
 		];
@@ -150,7 +157,7 @@ return view.extend({
 		}, 5);
 
 		m = new form.Map('sms2discord', _('SMS to Discord'),
-			_('Forwards every new SMS received by smstools3 to a Discord channel, and sends SMS from <code>!sms +15555550100 text</code> messages in that channel. Existing SMS are never forwarded and the inbox is never changed.') +
+			_('Forwards every new SMS received by smstools3 to a Discord channel, sends SMS from <code>!sms +15555550100 text</code> messages in that channel, and answers <code>!otp NAME</code> with an authenticator code. Existing SMS are never forwarded and the inbox is never changed.') +
 			' <a href="https://github.com/koraysels/sms2discord" target="_blank" rel="noreferrer">' + _('Documentation') + '</a>');
 
 		s = m.section(form.NamedSection, 'main', 'sms2discord');
@@ -202,7 +209,7 @@ return view.extend({
 		o = s.taboption('bot', form.Value, 'channel_id', _('Channel ID'), _('Channel the bot reads <code>!sms</code> commands from. Empty = the webhook\'s channel.'));
 		o.datatype = 'uinteger';
 
-		o = s.taboption('bot', form.DynamicList, 'allowed_user', _('Allowed Discord user IDs'), _('Only these users may send SMS. Empty = the bot\'s owner.'));
+		o = s.taboption('bot', form.DynamicList, 'allowed_user', _('Allowed Discord user IDs'), _('Only these users may use <code>!sms</code> and <code>!otp</code>. Empty = the bot\'s owner.'));
 		o.datatype = 'uinteger';
 
 		o = s.taboption('bot', form.Button, '_detect', _('Detect channel and owner'),
@@ -240,6 +247,34 @@ return view.extend({
 		o = s.taboption('advanced', form.Value, 'out_max_per_hour', _('Max outgoing SMS per hour'));
 		o.datatype = 'range(0,1000)';
 		o.placeholder = '10';
+
+		s = m.section(form.GridSection, 'otp', _('Authenticator (!otp)'),
+			_('For shared accounts that allow only one authenticator app. An allowed user types <code>!otp NAME</code> in the channel and the bot replies with the current code, then deletes that reply once the code has expired. Everyone in the channel can see the code, so only add accounts every member may use.') + '<br>' +
+			_('To add an account, set up the authenticator in that service and choose <em>can\'t scan the QR code?</em> (or decode the QR code) to get the secret key or the <code>otpauth://</code> link. If an authenticator app already has it, you usually have to turn 2FA off and on again to see the secret.'));
+		s.anonymous = true;
+		s.addremove = true;
+		s.nodescriptions = true;
+		s.addbtntitle = _('Add account');
+
+		o = s.option(form.Flag, 'enabled', _('Enabled'));
+		o.default = '1';
+		o.rmempty = false;
+		o.editable = true;
+
+		o = s.option(form.Value, 'name', _('Name'), _('Used in <code>!otp NAME</code>, e.g. <code>meta</code>.'));
+		o.rmempty = false;
+		o.validate = function(section_id, value) {
+			return OTP_NAME_RE.test(value || '') ? true : _('Letters, digits, . _ - (max 32)');
+		};
+
+		o = s.option(form.Value, 'secret', _('Secret key or otpauth:// link'),
+			_('Base32 secret (e.g. <code>JBSW Y3DP EHPK 3PXP</code>) or the full <code>otpauth://totp/…</code> link. SHA1 codes only, which is what nearly every service uses.'));
+		o.password = true;
+		o.modalonly = true;
+		o.rmempty = false;
+		o.validate = function(section_id, value) {
+			return OTP_SECRET_RE.test((value || '').trim()) ? true : _('Not a base32 secret or otpauth://totp link');
+		};
 
 		return m.render().then(function(mapEl) {
 			// LuCI replaces the page content after render(); notify once it's in place
