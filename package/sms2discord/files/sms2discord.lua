@@ -15,7 +15,7 @@
 
 local cjson = require "cjson"
 
-local VERSION = "0.6.0"
+local VERSION = "0.6.1"
 local CONF_DIR = "/etc/sms2discord"
 local CONF_FILE = "/etc/config/sms2discord"
 local LEGACY_CONF = CONF_DIR .. "/config"
@@ -992,10 +992,10 @@ function Relay.setup(c)
     .. ',"names":' .. json_list(c.otp_names) .. "}"
   code = http("POST", c.relay_url .. "/router/setup", setup, nil, c.RELAY_KEY)
   if code ~= 200 then return nil, "contacting the relay", code end
-  local opt = '[{"type":3,"name":"account","description":"Account","required":false,"autocomplete":true}]'
+  -- no options: the command answers with a row of buttons, one per account
   local cmds = "["
   for i, n in ipairs({ "otp", "auth" }) do
-    cmds = cmds .. (i > 1 and "," or "") .. '{"name":"' .. n .. '","type":1,"description":"Get an authenticator code","options":' .. opt .. "}"
+    cmds = cmds .. (i > 1 and "," or "") .. '{"name":"' .. n .. '","type":1,"description":"Pick an account and get its authenticator code"}'
   end
   code = http("PUT", API .. "/applications/" .. app.id .. "/guilds/" .. ch.guild_id .. "/commands", cmds .. "]", c.BOT_TOKEN)
   if code ~= 200 then return nil, "registering /otp", code end

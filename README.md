@@ -143,7 +143,7 @@ Or skip the menu with `!otp meta`. With only one account set up, `!otp` gives it
 
 The menu above uses reactions because a router can't receive Discord's button clicks: it has no public address. A tiny Cloudflare Worker (free plan) in [`relay/`](relay/) fixes that:
 
-- `/otp` (or `/auth`) shows real buttons, with autocomplete for the account name
+- `/otp` (or `/auth`) shows a row of buttons, one per account; a click shows that account's code
 - only the person who clicks sees the code (an ephemeral reply), so nothing needs deleting and the channel stays clean
 - the code turns into "expired" once it is no longer valid
 

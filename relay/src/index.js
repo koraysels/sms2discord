@@ -93,7 +93,6 @@ async function interaction(request, env, relay) {
   let type;
   if (it.type === 2) {
     name = String((it.data.options || []).find((o) => o.name === "account")?.value || "").toLowerCase();
-    if (!name && names.length === 1) name = names[0];
     if (!name) return names.length ? pickMenu(names) : reply("No authenticator accounts set up on the router.");
     type = 5; // deferred, ephemeral: the router fills it in
   } else if (it.type === 3 && String(it.data.custom_id || "").startsWith("otp:")) {
