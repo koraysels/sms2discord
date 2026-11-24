@@ -2,18 +2,25 @@
 
 # sms2discord
 
-Two-way SMS ↔ Discord bridge that runs **on the router itself**. Every SMS your router's SIM receives appears in a Discord channel within seconds, and `!sms +15555550100 hello` in that channel sends one back. `!otp` answers with an authenticator (TOTP) code for shared accounts that allow only one authenticator app.
+**Shared 2FA codes for your team, in Discord.** A router with a SIM card forwards every SMS (OTP codes included) to a Discord channel, and acts as the team's authenticator app for accounts that allow only one: type `/otp`, click the account, get the code.
 
-Built for OpenWrt routers with a cellular modem and `smstools3`, tested on a **GL.iNet GL-X2000 (Spitz Plus)** with firmware 4.7. Handy for OTP codes on a SIM that lives in a router.
+Runs **on the router itself**: OpenWrt routers with a cellular modem and `smstools3`, tested on a **GL.iNet GL-X2000 (Spitz Plus)** with firmware 4.7.
 
-- Pure Lua + curl (~30 KB), no server, no Docker, no e-mail relay
-- LuCI page to set it up and watch it (status, log, test button)
-- Only **new** SMS are forwarded, never the existing inbox
+**SMS codes**
+- Every new SMS appears in a Discord channel within seconds; the existing inbox is never forwarded
+- `!sms +15555550100 hello` in the channel sends an SMS back, with ⏳ → ✅/❌ status reactions
 - No duplicates, also after a reboot; retries while the internet is down
-- Mentions disabled, markdown escaped, link previews off
-- Secrets stay in `/etc/config/sms2discord` (`chmod 600`) and never appear in logs or on a command line. Logs never contain SMS text or phone numbers.
-- Sending is limited to allow-listed Discord users, with a rate limit and ⏳ → ✅/❌ status reactions
-- Authenticator codes (RFC 6238 TOTP, pure Lua, no extra packages); the bot deletes each code once it has expired
+
+**Authenticator (TOTP / MFA) codes**
+- For shared accounts that allow only one authenticator app: add the secret once in LuCI, then anyone on the allow-list can get the current code
+- `/otp` shows a button per account and only the person who clicks sees the code (needs the optional [Cloudflare relay](#discord-buttons-optional)); `!otp` works without it and deletes the code once it has expired
+- RFC 6238 TOTP in pure Lua, checked against the RFC test vectors; secrets never leave the router
+
+**Security and footprint**
+- Pure Lua + curl (~40 KB), no server needed, no Docker, no e-mail relay
+- LuCI page to set it up and watch it (status, log, test button)
+- Only allow-listed Discord users can send SMS or get codes; mentions disabled, markdown escaped, link previews off
+- Secrets stay in `/etc/config/sms2discord` (`chmod 600`) and never appear in logs or on a command line. Logs never contain SMS text, phone numbers or codes.
 
 ```
 modem ─▶ smsd ─▶ /etc/spool/sms/incoming/…   sms2discord polls every 2 s ─▶ Discord webhook ─▶ #sms
@@ -21,7 +28,12 @@ modem ─▶ smsd ─▶ /etc/spool/sms/incoming/…   sms2discord polls every 2
 modem ◀─ smsd ◀─ /etc/spool/sms/outgoing/…   sms2discord polls every 4 s ◀─ Discord bot (REST) ◀┘
 ```
 
-The router never needs inbound access: it only makes outgoing HTTPS requests to Discord.
+```
+/otp ─▶ Discord ─▶ relay (Cloudflare Worker, optional) ◀─ router polls every 2 s
+                                                         └─▶ asks Discord who clicked, answers with the code
+```
+
+The router never needs inbound access: it only makes outgoing HTTPS requests to Discord (and the relay).
 
 ---
 
