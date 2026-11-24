@@ -27,6 +27,7 @@ jobs:
       - name: Check LuCI files
         run: |
           node --check package/luci-app-sms2discord/htdocs/luci-static/resources/view/sms2discord.js
+          node --check relay/src/index.js
           for f in package/luci-app-sms2discord/root/usr/share/*/*.d/*.json; do python3 -m json.tool "$f" >/dev/null; done
           [ "$(sed -n 's/^PKG_VERSION:=//p' package/sms2discord/Makefile)" = "$(sed -n 's/^PKG_VERSION:=//p' package/luci-app-sms2discord/Makefile)" ]
 

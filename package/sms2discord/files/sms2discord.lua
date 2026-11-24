@@ -2,7 +2,8 @@
 -- sms2discord: forward incoming SMS from the smstools3 spool to a Discord
 -- webhook, and optionally send SMS from "!sms" commands in Discord and
 -- answer "!otp NAME" (or "!auth") with an authenticator (TOTP) code; "!otp"
--- alone posts a menu where a reaction picks the account.
+-- alone posts a menu where a reaction picks the account. With the optional
+-- relay (Cloudflare Worker), /otp shows real buttons and private replies.
 -- Works on OpenWrt with smstools3, including GL.iNet firmware 4.x.
 -- https://github.com/koraysels/sms2discord
 --
@@ -14,7 +15,7 @@
 
 local cjson = require "cjson"
 
-local VERSION = "0.5.1"
+local VERSION = "0.6.0"
 local CONF_DIR = "/etc/sms2discord"
 local CONF_FILE = "/etc/config/sms2discord"
 local LEGACY_CONF = CONF_DIR .. "/config"
@@ -24,6 +25,7 @@ local LASTID_FILE = CONF_DIR .. "/last_id"
 local RUN_DIR = "/tmp/sms2discord"
 local LOCK_DIR = RUN_DIR .. "/lock"
 local OTP_PENDING = RUN_DIR .. "/otp_pending" -- code replies still to delete
+local RELAY_STATE = RUN_DIR .. "/relay_state"
 -- GL.iNet generates its live config in /tmp; stock OpenWrt uses /etc/smsd.conf
 local SMSD_CFGS = { "/tmp/smstools.cfg", "/etc/smsd.conf" }
 local API = "https://discord.com/api/v10"
@@ -382,7 +384,7 @@ end
 local UCI_MAP = {
   WEBHOOK_URL = "webhook_url", BOT_TOKEN = "bot_token", CHANNEL_ID = "channel_id",
   ALLOWED_USER_IDS = "allowed_user", POLL_SMS = "poll_sms", POLL_DISCORD = "poll_discord",
-  OUT_MAX_PER_HOUR = "out_max_per_hour",
+  OUT_MAX_PER_HOUR = "out_max_per_hour", RELAY_URL = "relay_url", RELAY_KEY = "relay_key",
 }
 
 local function uci_cursor()
@@ -456,6 +458,15 @@ local function load_config()
   c.poll_sms = math.max(1, tonumber(c.POLL_SMS) or 2)
   c.poll_discord = math.max(2, tonumber(c.POLL_DISCORD) or 4)
   c.out_max = tonumber(c.OUT_MAX_PER_HOUR) or 10
+  -- a bad relay setting only disables the relay, never SMS forwarding
+  c.relay_url = (c.RELAY_URL or ""):gsub("/+$", "")
+  c.relay_err = nil
+  if c.relay_url ~= "" then
+    if not c.relay_url:match("^https://[%w%.%-]+[%w%./%-_]*$") then c.relay_err = "relay_url must be an https:// URL"
+    elseif not (c.RELAY_KEY or ""):match("^[%w_%-]+$") or #c.RELAY_KEY < 32 then c.relay_err = "relay_key must be 32+ letters/digits"
+    elseif not c.outbound then c.relay_err = "the relay needs the bot (bot token, channel, allowed users)" end
+  end
+  c.relay = c.relay_url ~= "" and not c.relay_err
   load_otp(c)
   return c, errs
 end
@@ -486,7 +497,7 @@ end
 
 -- ---------------------------------------------------------------- http
 
-local function http(method, url, body, token)
+local function http(method, url, body, token, bearer)
   -- URL and token go into a curl config file so they never appear in argv
   local cfg = RUN_DIR .. "/curl.cfg"
   local resp = RUN_DIR .. "/resp"
@@ -500,6 +511,7 @@ local function http(method, url, body, token)
     'write-out = "%{http_code}"',
   }
   if token then lines[#lines + 1] = 'header = "Authorization: Bot ' .. token .. '"' end
+  if bearer then lines[#lines + 1] = 'header = "Authorization: Bearer ' .. bearer .. '"' end
   if body then
     write_file(req, body, "600")
     lines[#lines + 1] = 'header = "Content-Type: application/json"'
@@ -690,13 +702,10 @@ function Outbound.save_expiring()
   write_atomic(OTP_PENDING, table.concat(t, "\n") .. "\n", "600")
 end
 
-function Outbound.otp_code(c, mid, name, now)
-  local e = c.otp[name]
-  if now < CLOCK_MIN then
-    bot_reply(c, mid, E_FAIL .. " The router clock is not set yet (NTP), so codes would be wrong.")
-    log("warning", "otp refused: router clock not synced")
-    return
-  end
+local CLOCK_MSG = E_FAIL .. " The router clock is not set yet (NTP), so codes would be wrong."
+
+-- code text and how long it stays useful (both codes when the first is nearly done)
+local function otp_text(e, name, now)
   local left = e.period - now % e.period
   local text = "\240\159\148\144 **" .. name .. "**  `" .. totp(e.key, now, e.digits, e.period) .. "`  valid " .. left .. " s"
   local life = left
@@ -704,6 +713,17 @@ function Outbound.otp_code(c, mid, name, now)
     text = text .. "\nnext  `" .. totp(e.key, now + e.period, e.digits, e.period) .. "`  from " .. left .. " s"
     life = life + e.period
   end
+  return text, life
+end
+
+function Outbound.otp_code(c, mid, name, now)
+  local e = c.otp[name]
+  if now < CLOCK_MIN then
+    bot_reply(c, mid, CLOCK_MSG)
+    log("warning", "otp refused: router clock not synced")
+    return
+  end
+  local text, life = otp_text(e, name, now)
   life = life + OTP_GRACE
   local code, resp = bot_reply(c, mid, text .. "\n-# deletes itself in " .. life .. " s")
   local ok, j = pcall(cjson.decode, resp)
@@ -945,6 +965,123 @@ function Outbound.tick(c, paths, now)
   end
 end
 
+-- ---------------------------------------------------------------- relay
+
+-- Optional Cloudflare Worker (relay/ in the repo) that receives /otp and button
+-- clicks from Discord. The router polls it, asks Discord who really clicked,
+-- and answers the interaction with an ephemeral code. Secrets stay here.
+local Relay = { ready = false, next_try = 0, warned = false, expiring = {} }
+
+local function relay_state(s)
+  write_file(RELAY_STATE, s .. "\n", "600")
+end
+
+local function json_list(t)
+  if #t == 0 then return "[]" end
+  return cjson.encode(t)
+end
+
+function Relay.setup(c)
+  local code, resp = http("GET", API .. "/applications/@me", nil, c.BOT_TOKEN)
+  local ok, app = pcall(cjson.decode, resp)
+  if code ~= 200 or not ok or type(app) ~= "table" then return nil, "reading the bot application", code end
+  code, resp = http("GET", API .. "/channels/" .. c.CHANNEL_ID, nil, c.BOT_TOKEN)
+  local ok2, ch = pcall(cjson.decode, resp)
+  if code ~= 200 or not ok2 or type(ch) ~= "table" or not ch.guild_id then return nil, "reading the channel", code end
+  local setup = '{"public_key":' .. cjson.encode(app.verify_key) .. ',"app_id":' .. cjson.encode(tostring(app.id))
+    .. ',"names":' .. json_list(c.otp_names) .. "}"
+  code = http("POST", c.relay_url .. "/router/setup", setup, nil, c.RELAY_KEY)
+  if code ~= 200 then return nil, "contacting the relay", code end
+  local opt = '[{"type":3,"name":"account","description":"Account","required":false,"autocomplete":true}]'
+  local cmds = "["
+  for i, n in ipairs({ "otp", "auth" }) do
+    cmds = cmds .. (i > 1 and "," or "") .. '{"name":"' .. n .. '","type":1,"description":"Get an authenticator code","options":' .. opt .. "}"
+  end
+  code = http("PUT", API .. "/applications/" .. app.id .. "/guilds/" .. ch.guild_id .. "/commands", cmds .. "]", c.BOT_TOKEN)
+  if code ~= 200 then return nil, "registering /otp", code end
+  local want = c.relay_url .. "/interactions"
+  if app.interactions_endpoint_url ~= want then
+    -- Discord pings the relay before it accepts the URL
+    code = http("PATCH", API .. "/applications/@me", '{"interactions_endpoint_url":' .. cjson.encode(want) .. "}", c.BOT_TOKEN)
+    if code ~= 200 then return nil, "setting the interactions endpoint", code end
+  end
+  return true
+end
+
+function Relay.answer(c, it, now)
+  local name = tostring(it.name or ""):lower()
+  local app, token = tostring(it.app or ""), tostring(it.token or "")
+  if not app:match("^%d+$") or not token:match("^[%w%._%-]+$") then return end
+  local url = API .. "/webhooks/" .. app .. "/" .. token .. "/messages/@original"
+  -- trust Discord, not the relay, for who asked
+  local code, resp = http("GET", url)
+  local ok, m = pcall(cjson.decode, resp)
+  local meta = ok and type(m) == "table" and (type(m.interaction_metadata) == "table" and m.interaction_metadata
+    or type(m.interaction) == "table" and m.interaction)
+  local uid = meta and type(meta.user) == "table" and tostring(meta.user.id)
+  if code ~= 200 or not uid then
+    log("warning", "could not verify an /otp request (HTTP " .. code .. ")")
+    return
+  end
+  local text, life = nil, 0
+  if not c.allowed[uid] then
+    text = E_BLOCK .. " You are not allowed to get codes."
+    log("warning", "ignored /otp from a user not in ALLOWED_USER_IDS")
+  elseif not c.otp[name] then
+    text = "Unknown account. Available: `" .. table.concat(c.otp_names, "`, `") .. "`"
+  elseif now < CLOCK_MIN then
+    text = CLOCK_MSG
+  else
+    text, life = otp_text(c.otp[name], name, now)
+  end
+  code = http("PATCH", url, '{"content":' .. cjson.encode(text) .. ',"components":[],' .. NO_MENTIONS .. "}")
+  if code ~= 200 then log("warning", "answering /otp failed (HTTP " .. code .. ")") return end
+  if life > 0 then
+    log("info", "otp code sent for '" .. name .. "' (button)")
+    Relay.expiring[#Relay.expiring + 1] = { url = url, name = name, at = now + life }
+  end
+end
+
+function Relay.tick(c, now)
+  -- replace a used code by a short note once it has expired (only the asker sees it)
+  local keep = {}
+  for _, x in ipairs(Relay.expiring) do
+    if now >= x.at then
+      http("PATCH", x.url, '{"content":' .. cjson.encode("\240\159\148\144 **" .. x.name .. "** code expired. Use `/otp` again.") .. "}")
+    else
+      keep[#keep + 1] = x
+    end
+  end
+  Relay.expiring = keep
+  if now < Relay.next_try then return end
+  if not Relay.ready then
+    local ok, step, code = Relay.setup(c)
+    if not ok then
+      relay_state("error: " .. step .. " failed (HTTP " .. tostring(code) .. ")")
+      log("warning", "relay setup: " .. step .. " failed (HTTP " .. tostring(code) .. ")")
+      Relay.next_try = now + 60
+      return
+    end
+    Relay.ready = true
+    relay_state("ok")
+    log("info", "relay ready: /otp with buttons enabled")
+  end
+  local code, resp = http("GET", c.relay_url .. "/router/queue", nil, nil, c.RELAY_KEY)
+  local ok, items = pcall(cjson.decode, resp)
+  if code ~= 200 or not ok or type(items) ~= "table" then
+    if not Relay.warned then log("warning", "relay poll failed (HTTP " .. code .. ")") end
+    Relay.warned = true
+    relay_state("error: relay poll failed (HTTP " .. code .. ")")
+    Relay.next_try = now + 10
+    return
+  end
+  if Relay.warned then relay_state("ok") end
+  Relay.warned = false
+  for _, it in ipairs(items) do
+    if type(it) == "table" then Relay.answer(c, it, now) end
+  end
+end
+
 -- ---------------------------------------------------------------- commands
 
 local function my_pid()
@@ -993,7 +1130,9 @@ local function cmd_run()
     .. (#c.otp_names > 0 and (", " .. #c.otp_names .. " authenticator account(s)") or ""))
   for _, e in ipairs(c.otp_errs) do log("warning", "config: " .. e) end
 
-  local next_sms, next_discord = 0, 0
+  local next_sms, next_discord, next_relay = 0, 0, 0
+  if not c.relay then os.remove(RELAY_STATE) end
+  if c.relay_err then log("warning", "config: " .. c.relay_err .. " (relay off)") end
   while true do
     local now = os.time()
     if now >= next_sms then
@@ -1003,6 +1142,10 @@ local function cmd_run()
     if c.outbound and now >= next_discord then
       Outbound.tick(c, paths, now)
       next_discord = now + c.poll_discord
+    end
+    if c.relay and now >= next_relay then
+      Relay.tick(c, now)
+      next_relay = now + 2
     end
     sleep(1)
   end
@@ -1172,6 +1315,8 @@ local function cmd_status(as_json)
     otp_names = table.concat(c.otp_names, " "),
     otp_errors = table.concat(c.otp_errs, "; "),
     clock_ok = os.time() >= CLOCK_MIN,
+    relay_set = c.relay_url ~= "",
+    relay_state = c.relay_err or (c.relay and (read_file(RELAY_STATE) or "starting"):gsub("%s+$", "")) or "",
   }
   if as_json then print(cjson.encode(st)) return end
   print("version:   " .. st.version)
@@ -1181,6 +1326,7 @@ local function cmd_status(as_json)
   print("outbound:  " .. (st.outbound and ("enabled, channel " .. st.channel_id) or "disabled"))
   print("otp:       " .. (#c.otp_names > 0 and table.concat(c.otp_names, ", ") or "none")
     .. (st.otp_errors ~= "" and (" (" .. st.otp_errors .. ")") or ""))
+  if st.relay_set then print("relay:     " .. st.relay_state) end
   print("seen sms:  " .. n .. (st.initialised and "" or " (not initialised yet)"))
   print("watching:  " .. (st.watching ~= "" and st.watching or "smstools config not found"))
   print("recent log:")

@@ -108,6 +108,9 @@ return view.extend({
 					st.clock_ok ? '' : [ ' ', yesNo(false, '', _('Router clock not synced')) ],
 					st.otp_errors ? [ ' ', E('em', {}, st.otp_errors) ] : '' ])
 				: (st.otp_errors ? E('em', {}, st.otp_errors) : yesNo(false, '', _('No accounts')))),
+			row(_('Discord buttons (/otp)'), st.relay_set
+				? (st.relay_state == 'ok' ? yesNo(true, _('Connected'), '') : E('em', {}, st.relay_state))
+				: yesNo(false, '', _('Off (no relay)'))),
 			row(_('Forwarded SMS'), st.initialised ? String(st.seen) : _('Not started yet (existing inbox is skipped on first start)')),
 			row(_('Watching'), E('code', {}, st.watching || _('smstools3 config not found')))
 		];
@@ -163,6 +166,7 @@ return view.extend({
 		s = m.section(form.NamedSection, 'main', 'sms2discord');
 		s.tab('general', _('Receiving'));
 		s.tab('bot', _('Sending (!sms)'));
+		s.tab('relay', _('Buttons (relay)'));
 		s.tab('advanced', _('Advanced'));
 
 		o = s.taboption('general', form.Flag, 'enabled', _('Enabled'));
@@ -234,6 +238,22 @@ return view.extend({
 			}).then(function() {
 				location.reload(); // show the detected IDs in the form
 			});
+		};
+
+		o = s.taboption('relay', form.DummyValue, '_relay_help', _('What this does'));
+		o.rawhtml = true;
+		o.default = _('Optional. With a small Cloudflare Worker (<code>relay/</code> in the repository, free plan), <code>/otp</code> in Discord shows real buttons and only the person who clicks sees the code. The Worker never sees your authenticator secrets: the router asks Discord who clicked and answers the click itself. Setup: see the <a href="https://github.com/koraysels/sms2discord#discord-buttons-optional" target="_blank" rel="noreferrer">README</a>. The router registers <code>/otp</code> and sets the bot\'s Interactions Endpoint URL by itself.');
+
+		o = s.taboption('relay', form.Value, 'relay_url', _('Relay URL'), _('e.g. <code>https://sms2discord-relay.yourname.workers.dev</code>. Empty = off.'));
+		o.placeholder = 'https://sms2discord-relay.….workers.dev';
+		o.validate = function(section_id, value) {
+			return (!value || /^https:\/\/[\w.-]+(\/[\w.\/-]*)?$/.test(value)) ? true : _('Must be an https:// URL');
+		};
+
+		o = s.taboption('relay', form.Value, 'relay_key', _('Relay key'), _('The <code>RELAY_KEY</code> secret you set on the Worker (32+ letters and digits).'));
+		o.password = true;
+		o.validate = function(section_id, value) {
+			return (!value || /^[\w-]{32,}$/.test(value)) ? true : _('32+ letters, digits, - or _');
 		};
 
 		o = s.taboption('advanced', form.Value, 'poll_sms', _('Inbox check interval'), _('Seconds'));

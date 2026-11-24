@@ -139,6 +139,29 @@ Or skip the menu with `!otp meta`. With only one account set up, `!otp` gives it
 - SHA1 only (what nearly every service uses), 6–8 digits, any period.
 - Codes depend on the router clock; if NTP has not synced yet, the bot refuses instead of giving wrong codes.
 
+### Discord buttons (optional)
+
+The menu above uses reactions because a router can't receive Discord's button clicks: it has no public address. A tiny Cloudflare Worker (free plan) in [`relay/`](relay/) fixes that:
+
+- `/otp` (or `/auth`) shows real buttons, with autocomplete for the account name
+- only the person who clicks sees the code (an ephemeral reply), so nothing needs deleting and the channel stays clean
+- the code turns into "expired" once it is no longer valid
+
+The Worker holds **no authenticator secrets**, only the account names and the bot's public key. For every click the router asks Discord itself who clicked, checks that person against the allow-list, computes the code and answers the click directly. A compromised Worker can stop the buttons from working, but it can't get codes.
+
+Setup, once:
+
+```bash
+cd relay
+npx wrangler login
+npx wrangler deploy                 # prints https://sms2discord-relay.<you>.workers.dev
+openssl rand -hex 32 | tee .relay-key | npx wrangler secret put RELAY_KEY
+```
+
+Then in LuCI → **Buttons (relay)**: paste the Worker URL and the key from `relay/.relay-key`, and Save & Apply. The router registers `/otp` and `/auth` in your server and sets the bot's *Interactions Endpoint URL* by itself; the status shows **Discord buttons: Connected**. The router checks the Worker every 2 s (about 43,000 requests a day, within the free plan's 100,000).
+
+`!otp` in the channel keeps working, with or without the relay.
+
 Anyone who can read the channel and knows the password can log in, so turn on 2FA for the Discord accounts in that channel. Some services forbid sharing an account in their terms; that is your call.
 
 ## Manage (on the router)
@@ -166,6 +189,8 @@ Config: UCI `/etc/config/sms2discord` (`chmod 600`, kept on package upgrades), s
 | `poll_sms` | `2` | Seconds between inbox checks |
 | `poll_discord` | `4` | Seconds between Discord checks |
 | `out_max_per_hour` | `10` | Outgoing SMS limit |
+| `relay_url` | empty | Cloudflare Worker for `/otp` buttons; empty = off |
+| `relay_key` | empty | Shared secret with the Worker (`RELAY_KEY`) |
 
 Authenticator accounts are `otp` sections:
 
@@ -178,7 +203,7 @@ config otp
 
 State lives in `/etc/sms2discord/`: `seen` (forwarded files) and `last_id` (last Discord message handled). Configs from v0.1/v0.2 (`/etc/sms2discord/config`) are migrated automatically.
 
-`/etc/config` is part of router backups, so a backup contains your webhook URL, bot token and authenticator secrets. Keep backups private.
+`/etc/config` is part of router backups, so a backup contains your webhook URL, bot token, relay key and authenticator secrets. Keep backups private.
 
 ## Uninstall
 
