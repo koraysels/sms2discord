@@ -1,7 +1,8 @@
 #!/usr/bin/lua
 -- sms2discord: forward incoming SMS from the smstools3 spool to a Discord
 -- webhook, and optionally send SMS from "!sms" commands in Discord and
--- answer "!otp NAME" with an authenticator (TOTP) code.
+-- answer "!otp NAME" (or "!auth") with an authenticator (TOTP) code; "!otp"
+-- alone posts a menu where a reaction picks the account.
 -- Works on OpenWrt with smstools3, including GL.iNet firmware 4.x.
 -- https://github.com/koraysels/sms2discord
 --
@@ -13,7 +14,7 @@
 
 local cjson = require "cjson"
 
-local VERSION = "0.4.0"
+local VERSION = "0.5.0"
 local CONF_DIR = "/etc/sms2discord"
 local CONF_FILE = "/etc/config/sms2discord"
 local LEGACY_CONF = CONF_DIR .. "/config"
@@ -31,6 +32,7 @@ local MAX_DISCORD_CHARS = 1990
 local MAX_SMS_CHARS = 459 -- 3 concatenated GSM-7 parts (smsd autosplit = 3)
 local TRACK_SECONDS = 900
 local OTP_GRACE = 15 -- keep a code visible this long after it expires
+local MENU_SECONDS = 60 -- an !otp menu stays open this long
 local CLOCK_MIN = 1700000000 -- before this the router clock is not synced
 
 -- ---------------------------------------------------------------- helpers
@@ -649,7 +651,18 @@ end
 
 -- ---------------------------------------------------------------- outbound
 
-local Outbound = { last_id = nil, next_try = 0, sent_times = {}, tracking = {}, warned = false, expiring = nil }
+local Outbound = { last_id = nil, next_try = 0, sent_times = {}, tracking = {}, warned = false, expiring = nil, menus = {} }
+
+-- reactions that act as menu buttons: 1-9, 10, then A-J
+local MENU_EMOJI = {}
+for i = 1, 9 do MENU_EMOJI[i] = tostring(i) .. "\239\184\143\226\131\163" end
+MENU_EMOJI[10] = "\240\159\148\159"
+for i = 0, 9 do MENU_EMOJI[11 + i] = "\240\159\135" .. string.char(166 + i) end
+
+-- Discord may or may not keep the U+FE0F variation selector in emoji names
+local function emoji_key(e)
+  return (e or ""):gsub("\239\184\143", "")
+end
 
 local function queue_sms(paths, num, text)
   local toa = num:sub(1, 1) == "+" and "international" or "National"
@@ -677,18 +690,8 @@ function Outbound.save_expiring()
   write_atomic(OTP_PENDING, table.concat(t, "\n") .. "\n", "600")
 end
 
-function Outbound.otp(c, mid, content, now)
-  local name = (content:match("^!otp%s+(%S+)") or ""):lower()
-  local list = #c.otp_names > 0 and ("`" .. table.concat(c.otp_names, "`, `") .. "`") or nil
-  if not list then
-    bot_reply(c, mid, "No authenticator accounts set up. Add them in LuCI: Services \226\134\146 SMS to Discord \226\134\146 Authenticator.")
-    return
-  end
+function Outbound.otp_code(c, mid, name, now)
   local e = c.otp[name]
-  if not e then
-    bot_reply(c, mid, (name == "" and "Usage: `!otp NAME`" or "Unknown name.") .. " Available: " .. list)
-    return
-  end
   if now < CLOCK_MIN then
     bot_reply(c, mid, E_FAIL .. " The router clock is not set yet (NTP), so codes would be wrong.")
     log("warning", "otp refused: router clock not synced")
@@ -709,6 +712,95 @@ function Outbound.otp(c, mid, content, now)
     Outbound.save_expiring()
   end
   log("info", "otp code sent for '" .. name .. "'")
+end
+
+local function react_retry(c, id, emoji)
+  local code, resp = bot_react(c, id, emoji)
+  if code == 429 then
+    sleep(retry_after(resp))
+    code = bot_react(c, id, emoji)
+  end
+  return code
+end
+
+function Outbound.otp_menu(c, mid, now)
+  local names, lines = {}, { "\240\159\148\144 Pick an account:" }
+  for i, name in ipairs(c.otp_names) do
+    if i > #MENU_EMOJI then break end
+    names[i] = name
+    lines[#lines + 1] = MENU_EMOJI[i] .. " " .. name
+  end
+  if #c.otp_names > #MENU_EMOJI then
+    lines[#lines + 1] = "\226\128\166 and " .. (#c.otp_names - #MENU_EMOJI) .. " more: use `!otp NAME`"
+  end
+  lines[#lines + 1] = "-# closes in " .. MENU_SECONDS .. " s"
+  local code, resp = bot_reply(c, mid, table.concat(lines, "\n"))
+  local ok, j = pcall(cjson.decode, resp)
+  if not (code >= 200 and code < 300 and ok and type(j) == "table" and j.id) then
+    log("warning", "could not post otp menu (HTTP " .. code .. ")")
+    return
+  end
+  local menu = { id = tostring(j.id), mid = mid, at = now + MENU_SECONDS, opts = {}, gone = { id = tostring(j.id), at = now + MENU_SECONDS } }
+  -- deleted on time even if the service restarts before anyone picks
+  Outbound.expiring[#Outbound.expiring + 1] = menu.gone
+  Outbound.save_expiring()
+  Outbound.menus[#Outbound.menus + 1] = menu
+  for i, name in ipairs(names) do
+    menu.opts[emoji_key(MENU_EMOJI[i])] = name
+    if react_retry(c, menu.id, MENU_EMOJI[i]) >= 300 then break end
+  end
+end
+
+-- a pick is a reaction from an allow-listed user on an open menu
+function Outbound.poll_menus(c, now)
+  local keep = {}
+  for _, menu in ipairs(Outbound.menus) do
+    local done = now >= menu.at
+    if not done then
+      local base = API .. "/channels/" .. c.CHANNEL_ID .. "/messages/" .. menu.id
+      local code, resp = http("GET", base, nil, c.BOT_TOKEN)
+      local ok, m = pcall(cjson.decode, resp)
+      if code == 404 then
+        done = true
+      elseif code == 200 and ok and type(m) == "table" then
+        for _, r in ipairs(type(m.reactions) == "table" and m.reactions or {}) do
+          local name = type(r.emoji) == "table" and menu.opts[emoji_key(r.emoji.name)]
+          -- skip reactions that are only the bot's own
+          if name and (tonumber(r.count) or 0) > (r.me and 1 or 0) then
+            local ucode, uresp = http("GET", base .. "/reactions/" .. urlenc(r.emoji.name) .. "?limit=25", nil, c.BOT_TOKEN)
+            local uok, users = pcall(cjson.decode, uresp)
+            if ucode == 200 and uok and type(users) == "table" then
+              for _, u in ipairs(users) do
+                if type(u) == "table" and c.allowed[tostring(u.id)] then done = name break end
+              end
+            end
+          end
+          if done then break end
+        end
+      end
+    end
+    if done then
+      menu.gone.at = 0 -- delete the menu now
+      if type(done) == "string" and c.otp[done] then Outbound.otp_code(c, menu.mid, done, now) end
+    else
+      keep[#keep + 1] = menu
+    end
+  end
+  Outbound.menus = keep
+end
+
+function Outbound.otp(c, mid, content, now)
+  local name = (content:match("^!%a+%s+(%S+)") or ""):lower()
+  if #c.otp_names == 0 then
+    bot_reply(c, mid, "No authenticator accounts set up. Add them in LuCI: Services \226\134\146 SMS to Discord \226\134\146 Authenticator.")
+    return
+  end
+  if name == "" then return Outbound.otp_menu(c, mid, now) end
+  if not c.otp[name] then
+    bot_reply(c, mid, "Unknown name. Available: `" .. table.concat(c.otp_names, "`, `") .. "`")
+    return
+  end
+  Outbound.otp_code(c, mid, name, now)
 end
 
 function Outbound.expire(c, now)
@@ -734,6 +826,7 @@ function Outbound.handle(c, paths, m, now)
   if m.webhook_id or (m.author and m.author.bot) then return end
   local content = (m.content or ""):gsub("\r", "")
   local cmd = content:match("^!(%a+)")
+  if cmd == "auth" then cmd = "otp" end
   if cmd ~= "sms" and cmd ~= "otp" then return end
   local mid = tostring(m.id)
   local uid = m.author and tostring(m.author.id) or ""
@@ -802,6 +895,7 @@ function Outbound.tick(c, paths, now)
       Outbound.expiring[#Outbound.expiring + 1] = { id = id, at = tonumber(at) }
     end
   end
+  if #Outbound.menus > 0 then Outbound.poll_menus(c, now) end
   if #Outbound.expiring > 0 then Outbound.expire(c, now) end
   if now < Outbound.next_try then return end
   local base = API .. "/channels/" .. c.CHANNEL_ID .. "/messages"
@@ -1178,6 +1272,13 @@ local function cmd_selftest()
     "only SHA1 is supported, not SHA256")
   eq("reject hotp", select(2, parse_otp_secret("otpauth://hotp/x?secret=JBSWY3DPEHPK3PXP&counter=1")),
     "only otpauth://totp links are supported")
+  local keys = {}
+  for i, em in ipairs(MENU_EMOJI) do keys[emoji_key(em)] = i end
+  local nkeys = 0
+  for _ in pairs(keys) do nkeys = nkeys + 1 end
+  eq("menu emoji unique", nkeys, 20)
+  eq("menu emoji fe0f", keys[emoji_key("1\226\131\163")], 1)
+  eq("menu emoji J", MENU_EMOJI[20], "\240\159\135\175")
   eq("reject junk", select(2, parse_otp_secret("not a secret!")), "secret is not valid base32")
   print(fails == 0 and "selftest OK" or ("selftest: " .. fails .. " failure(s)"))
   os.exit(fails == 0 and 0 or 1)

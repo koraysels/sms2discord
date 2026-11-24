@@ -249,7 +249,7 @@ return view.extend({
 		o.placeholder = '10';
 
 		s = m.section(form.GridSection, 'otp', _('Authenticator (!otp)'),
-			_('For shared accounts that allow only one authenticator app. An allowed user types <code>!otp NAME</code> in the channel and the bot replies with the current code, then deletes that reply once the code has expired. Everyone in the channel can see the code, so only add accounts every member may use.') + '<br>' +
+			_('For shared accounts that allow only one authenticator app. An allowed user types <code>!otp</code> (or <code>!auth</code>) in the channel and picks the account by clicking a reaction, or types <code>!otp NAME</code>. The bot replies with the current code and deletes that reply once the code has expired. Everyone in the channel can see the code, so only add accounts every member may use.') + '<br>' +
 			_('To add an account, set up the authenticator in that service and choose <em>can\'t scan the QR code?</em> (or decode the QR code) to get the secret key or the <code>otpauth://</code> link. If an authenticator app already has it, you usually have to turn 2FA off and on again to see the secret.'));
 		s.anonymous = true;
 		s.addremove = true;

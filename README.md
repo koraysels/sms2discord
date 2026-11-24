@@ -2,7 +2,7 @@
 
 # sms2discord
 
-Two-way SMS ↔ Discord bridge that runs **on the router itself**. Every SMS your router's SIM receives appears in a Discord channel within seconds, and `!sms +15555550100 hello` in that channel sends one back. `!otp NAME` answers with an authenticator (TOTP) code for shared accounts that allow only one authenticator app.
+Two-way SMS ↔ Discord bridge that runs **on the router itself**. Every SMS your router's SIM receives appears in a Discord channel within seconds, and `!sms +15555550100 hello` in that channel sends one back. `!otp` answers with an authenticator (TOTP) code for shared accounts that allow only one authenticator app.
 
 Built for OpenWrt routers with a cellular modem and `smstools3`, tested on a **GL.iNet GL-X2000 (Spitz Plus)** with firmware 4.7. Handy for OTP codes on a SIM that lives in a router.
 
@@ -116,10 +116,13 @@ Everyone who can read the channel can read your OTP codes. Keep it private.
 
 ### Authenticator codes
 
-For accounts your team shares that allow only one authenticator app. Add each account once in LuCI (**Services → SMS to Discord → Authenticator → Add account**) with a short name and its secret key or `otpauth://totp/…` link. To get the secret, choose *can't scan the QR code?* while setting up 2FA in that service. If the account already uses an authenticator app, you usually have to turn 2FA off and on again to see the secret. Then, in the channel:
+For accounts your team shares that allow only one authenticator app. Add each account once in LuCI (**Services → SMS to Discord → Authenticator → Add account**) with a short name and its secret key or `otpauth://totp/…` link. To get the secret, choose *can't scan the QR code?* while setting up 2FA in that service. If the account already uses an authenticator app, you usually have to turn 2FA off and on again to see the secret. Then, in the channel, type `!otp` (or `!auth`) and click the reaction for the account:
 
 ```
-!otp meta
+🔐 Pick an account:
+1️⃣ billit
+2️⃣ meta
+closes in 60 s                [1️⃣] [2️⃣]
 ```
 
 ```
@@ -127,7 +130,10 @@ For accounts your team shares that allow only one authenticator app. Add each ac
 deletes itself in 33 s
 ```
 
-- Only allow-listed users can ask for a code; `!otp` alone lists the names (never codes).
+Or skip the menu with `!otp meta`.
+
+- Only allow-listed users can ask for a code or pick from the menu.
+- The menu shows up to 20 accounts and closes after 60 s; a pick shows up within one Discord check (4 s by default). Discord buttons would need a public endpoint, which a router doesn't have, so reactions do the job.
 - With less than 10 s left, the reply also shows the next code.
 - The bot deletes its reply 15 s after the code expires. The secret never goes through Discord, and codes are never logged.
 - SHA1 only (what nearly every service uses), 6–8 digits, any period.
