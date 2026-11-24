@@ -130,7 +130,7 @@ closes in 60 s                [1️⃣] [2️⃣]
 deletes itself in 33 s
 ```
 
-Or skip the menu with `!otp meta`.
+Or skip the menu with `!otp meta`. With only one account set up, `!otp` gives its code right away.
 
 - Only allow-listed users can ask for a code or pick from the menu.
 - The menu shows up to 20 accounts and closes after 60 s; a pick shows up within one Discord check (4 s by default). Discord buttons would need a public endpoint, which a router doesn't have, so reactions do the job.

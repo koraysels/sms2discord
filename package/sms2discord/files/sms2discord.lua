@@ -14,7 +14,7 @@
 
 local cjson = require "cjson"
 
-local VERSION = "0.5.0"
+local VERSION = "0.5.1"
 local CONF_DIR = "/etc/sms2discord"
 local CONF_FILE = "/etc/config/sms2discord"
 local LEGACY_CONF = CONF_DIR .. "/config"
@@ -795,6 +795,7 @@ function Outbound.otp(c, mid, content, now)
     bot_reply(c, mid, "No authenticator accounts set up. Add them in LuCI: Services \226\134\146 SMS to Discord \226\134\146 Authenticator.")
     return
   end
+  if name == "" and #c.otp_names == 1 then name = c.otp_names[1] end -- nothing to pick
   if name == "" then return Outbound.otp_menu(c, mid, now) end
   if not c.otp[name] then
     bot_reply(c, mid, "Unknown name. Available: `" .. table.concat(c.otp_names, "`, `") .. "`")
