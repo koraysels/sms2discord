@@ -7,3 +7,4 @@ relay/.relay-key
 relay/.wrangler/
 relay/node_modules/
 relay/.dev.vars
+.apk-sign-key.pem

@@ -3,6 +3,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+    branches: ["ci/**"]
   pull_request:
 
 jobs:
@@ -49,17 +50,56 @@ jobs:
           mkdir -p site/packages
           cp dist/feed/* site/packages/
           cat > site/index.html <<'HTML'
-          <!doctype html><meta charset="utf-8"><title>sms2discord opkg feed</title>
+          <!doctype html><meta charset="utf-8"><title>sms2discord package feeds</title>
           <link rel="icon" href="favicon.png">
           <p><img src="logo.png" alt="sms2discord logo" width="160"></p>
-          <h1>sms2discord opkg feed</h1>
+          <h1>sms2discord package feeds</h1>
           <p>Add this source on your router, then install <code>sms2discord</code> and <code>luci-app-sms2discord</code>:</p>
           <pre>https://koraysels.github.io/sms2discord/packages</pre>
           <p>GL.iNet: Applications → Plug-ins → Manage Sources. OpenWrt: add
           <code>src/gz sms2discord https://koraysels.github.io/sms2discord/packages</code> to <code>/etc/opkg/customfeeds.conf</code>.</p>
+          <p>OpenWrt 25.12+ (apk): <a href="apk/sms2discord.pem">signing key</a> · <a href="apk/packages.adb">packages.adb</a>, see the README.</p>
           <p><a href="https://github.com/koraysels/sms2discord">Documentation and source</a> · <a href="packages/Packages">Packages</a></p>
           HTML
           cp docs/logo.png docs/favicon.png site/
+
+      - name: apk signing key
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        run: |
+          k=$RUNNER_TEMP/key && mkdir -p $k
+          if [ -n "$APK_SIGN_KEY" ]; then
+            printf '%s\n' "$APK_SIGN_KEY" > $k/private-key.pem
+            openssl ec -in $k/private-key.pem -pubout -out $k/sms2discord.pem 2>/dev/null
+            # the published key must match, or routers reject the feed
+            cmp $k/sms2discord.pem keys/sms2discord-apk.pem
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "APK_SIGN_KEY secret missing"; exit 1
+          else
+            echo "no APK_SIGN_KEY: signing with a throwaway key (test build)"
+            openssl ecparam -name prime256v1 -genkey -noout -out $k/private-key.pem
+            openssl ec -in $k/private-key.pem -pubout -out $k/sms2discord.pem 2>/dev/null
+          fi
+          chmod 644 $k/*.pem
+
+      - name: Build apk (OpenWrt 25.12 SDK)
+        run: |
+          mkdir -p dist/apkbuild && chmod 777 dist/apkbuild
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist/apkbuild:/out" -v "$RUNNER_TEMP/key:/key:ro" \
+            openwrt/sdk:x86-64-25.12.3 bash /src/tools/build-apk.sh /src /out /key/private-key.pem
+
+      - name: Test apk install (OpenWrt 25.12)
+        run: |
+          docker run --rm -v "$PWD/dist/apkbuild/apk:/repo:ro" -v "$RUNNER_TEMP/key:/key:ro" openwrt/rootfs:x86-64-25.12.2 sh -c '
+            set -e; mkdir -p /var/lock
+            cp /key/sms2discord.pem /etc/apk/keys/
+            echo /repo/packages.adb >> /etc/apk/repositories.d/customfeeds.list
+            apk update && apk add sms2discord luci-app-sms2discord
+            apk info -v 2>/dev/null | grep sms2discord
+            sms2discord selftest'
+          mkdir -p site/apk
+          cp dist/apkbuild/apk/* site/apk/
+          cp "$RUNNER_TEMP/key/sms2discord.pem" site/apk/sms2discord.pem
 
       - uses: actions/upload-pages-artifact@v3
         if: startsWith(github.ref, 'refs/tags/')
@@ -70,7 +110,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/*.ipk --generate-notes --title "${GITHUB_REF_NAME}" || gh release upload "${GITHUB_REF_NAME}" dist/*.ipk --clobber
+        run: |
+          files="dist/*.ipk dist/apkbuild/apk/*.apk"
+          gh release create "${GITHUB_REF_NAME}" $files --generate-notes --title "${GITHUB_REF_NAME}" || gh release upload "${GITHUB_REF_NAME}" $files --clobber
 
   pages:
     if: startsWith(github.ref, 'refs/tags/')

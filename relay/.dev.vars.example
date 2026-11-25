@@ -1,0 +1,3 @@
+# Shared secret with the router (LuCI: Buttons (relay) -> Relay key).
+# 32+ letters and digits, e.g. the output of: openssl rand -hex 32
+RELAY_KEY=

@@ -37,15 +37,34 @@ The router never needs inbound access: it only makes outgoing HTTPS requests to 
 
 ---
 
+## Compatibility
+
+sms2discord reads and writes the **smstools3** spool, so it works on any router where smstools3 handles the modem's SMS:
+
+| Router / firmware | Status |
+|---|---|
+| GL.iNet GL-X2000 (Spitz Plus), firmware 4.7.13 and 4.7.14 | **Works**, tested daily. GL.iNet ships smstools3 for its SMS features. |
+| Other GL.iNet 4.x routers with a cellular modem (X3000, XE3000, …) | Should work if their firmware also uses smstools3 (`ls /etc/spool/sms` shows it). Not tested. |
+| OpenWrt 19.07 – 24.10 with smstools3 set up for the modem | Should work (opkg feed). Not tested on real hardware beyond GL.iNet. |
+| OpenWrt 25.12 and newer (apk) with smstools3 | Should work (apk feed, installs cleanly in an OpenWrt 25.12 test system). Not tested on real hardware. |
+| Routers that handle SMS with ModemManager (`mmcli`), `sms-tool` or the vendor's own daemon | **Not supported.** SMS never reach the smstools3 spool. |
+
+Authenticator codes (`!otp`, `/otp`) only need the Discord bot, not the modem, so they work on any OpenWrt router.
+
 ## Requirements
 
 - OpenWrt 19.07 or newer, or GL.iNet firmware 4.x, with a modem and **smstools3** receiving SMS
-- `lua`, `lua-cjson`, `libuci-lua`, `curl` (pre-installed on GL.iNet 4.x; `opkg` pulls them in otherwise)
+- `lua`, `lua-cjson`, `libuci-lua`, `curl` (pre-installed on GL.iNet 4.x; the package manager pulls them in otherwise)
 - For the web UI: LuCI. On GL.iNet: **System → Advanced Settings → Install Now**, LuCI then runs on port 8080.
 
 ## Install
 
-Two packages, both architecture-independent: `sms2discord` (the service) and `luci-app-sms2discord` (the web UI, optional).
+Two packages, both architecture-independent: `sms2discord` (the service) and `luci-app-sms2discord` (the web UI, optional). They are published in two feeds on GitHub Pages, one per package manager:
+
+| Package manager | Feed |
+|---|---|
+| `opkg` (OpenWrt ≤ 24.10, GL.iNet 4.x) | `https://koraysels.github.io/sms2discord/packages` |
+| `apk` (OpenWrt 25.12+) | `https://koraysels.github.io/sms2discord/apk/packages.adb`, signed with [`sms2discord.pem`](https://koraysels.github.io/sms2discord/apk/sms2discord.pem) |
 
 ### Option A: GL.iNet Plug-ins page (easiest)
 
@@ -54,6 +73,16 @@ Two packages, both architecture-independent: `sms2discord` (the service) and `lu
 3. **Refresh**, search `sms2discord`, install `sms2discord`, then `luci-app-sms2discord`
 
 The same feed works on stock OpenWrt: add `src/gz sms2discord https://koraysels.github.io/sms2discord/packages` to `/etc/opkg/customfeeds.conf`, then `opkg update && opkg install sms2discord luci-app-sms2discord`. The feed is unsigned. If your opkg has `option check_signature` enabled, use option B instead.
+
+### Option A2: OpenWrt 25.12+ (apk)
+
+```bash
+wget -O /etc/apk/keys/sms2discord.pem https://koraysels.github.io/sms2discord/apk/sms2discord.pem
+echo https://koraysels.github.io/sms2discord/apk/packages.adb >> /etc/apk/repositories.d/customfeeds.list
+apk update && apk add sms2discord luci-app-sms2discord
+```
+
+The key makes apk check the feed's signature; updates then come with `apk upgrade`.
 
 ### Option B: download the packages
 
@@ -161,7 +190,11 @@ The menu above uses reactions because a router can't receive Discord's button cl
 
 The Worker holds **no authenticator secrets**, only the account names and the bot's public key. For every click the router asks Discord itself who clicked, checks that person against the allow-list, computes the code and answers the click directly. A compromised Worker can stop the buttons from working, but it can't get codes.
 
-Setup, once:
+Setup, once. Either click
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/koraysels/sms2discord/tree/main/relay)
+
+and fill in `RELAY_KEY` (32+ letters and digits, e.g. from `openssl rand -hex 32`), or from a clone:
 
 ```bash
 cd relay
