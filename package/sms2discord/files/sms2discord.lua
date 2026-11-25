@@ -15,7 +15,7 @@
 
 local cjson = require "cjson"
 
-local VERSION = "0.6.1"
+local VERSION = "0.6.2"
 local CONF_DIR = "/etc/sms2discord"
 local CONF_FILE = "/etc/config/sms2discord"
 local LEGACY_CONF = CONF_DIR .. "/config"

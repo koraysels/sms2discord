@@ -6,7 +6,7 @@ LUCI_TITLE:=LuCI support for sms2discord
 LUCI_DEPENDS:=+luci-base +sms2discord
 LUCI_PKGARCH:=all
 
-PKG_VERSION:=0.6.1
+PKG_VERSION:=0.6.2
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=Koray Sels <koray.sels@gmail.com>
