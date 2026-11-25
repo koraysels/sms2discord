@@ -175,7 +175,7 @@ deletes itself in 33 s
 
 Or skip the menu with `!otp meta`. With only one account set up, `!otp` gives its code right away.
 
-- Only allow-listed users can ask for a code or pick from the menu.
+- Only allowed users can ask for a code or pick from the menu: listed user IDs, or anyone with an allowed Discord role. With a role (e.g. *OTP*, picked in LuCI under **Sending (!sms)**) you grant and revoke access in Discord itself.
 - The menu shows up to 20 accounts and closes after 60 s; a pick shows up within one Discord check (4 s by default). Discord buttons would need a public endpoint, which a router doesn't have, so reactions do the job.
 - With less than 10 s left, the reply also shows the next code.
 - The bot deletes its reply 15 s after the code expires. The secret never goes through Discord, and codes are never logged.
@@ -232,7 +232,8 @@ Config: UCI `/etc/config/sms2discord` (`chmod 600`, kept on package upgrades), s
 | `webhook_url` | | Discord webhook for incoming SMS |
 | `bot_token` | empty | Bot token; empty disables `!sms` |
 | `channel_id` | webhook's channel | Channel the bot reads |
-| `allowed_user` (list) | bot owner | Discord user IDs allowed to send |
+| `allowed_user` (list) | bot owner | Discord user IDs allowed to send SMS and get codes |
+| `allowed_role` (list) | empty | Discord role IDs whose members are allowed too |
 | `poll_sms` | `2` | Seconds between inbox checks |
 | `poll_discord` | `4` | Seconds between Discord checks |
 | `out_max_per_hour` | `10` | Outgoing SMS limit |

@@ -7,7 +7,7 @@
 -- Works on OpenWrt with smstools3, including GL.iNet firmware 4.x.
 -- https://github.com/koraysels/sms2discord
 --
--- Usage: sms2discord run|setup|set-bot|detect|migrate|status [--json]|test|otp NAME|selftest
+-- Usage: sms2discord run|setup|set-bot|detect|migrate|status [--json]|test|otp NAME|roles|selftest
 --
 -- Config: UCI /etc/config/sms2discord (older versions: /etc/sms2discord/config).
 --
@@ -15,7 +15,7 @@
 
 local cjson = require "cjson"
 
-local VERSION = "0.6.2"
+local VERSION = "0.7.0"
 local CONF_DIR = "/etc/sms2discord"
 local CONF_FILE = "/etc/config/sms2discord"
 local LEGACY_CONF = CONF_DIR .. "/config"
@@ -383,7 +383,7 @@ end
 -- internal key -> UCI option in sms2discord.main
 local UCI_MAP = {
   WEBHOOK_URL = "webhook_url", BOT_TOKEN = "bot_token", CHANNEL_ID = "channel_id",
-  ALLOWED_USER_IDS = "allowed_user", POLL_SMS = "poll_sms", POLL_DISCORD = "poll_discord",
+  ALLOWED_USER_IDS = "allowed_user", ALLOWED_ROLE_IDS = "allowed_role", POLL_SMS = "poll_sms", POLL_DISCORD = "poll_discord",
   OUT_MAX_PER_HOUR = "out_max_per_hour", RELAY_URL = "relay_url", RELAY_KEY = "relay_key",
 }
 
@@ -450,7 +450,10 @@ local function load_config()
   c.enabled = c.ENABLED ~= "0"
   c.allowed = {}
   for id in (c.ALLOWED_USER_IDS or ""):gmatch("%d+") do c.allowed[id] = true end
-  c.outbound = (c.BOT_TOKEN or "") ~= "" and (c.CHANNEL_ID or "") ~= "" and next(c.allowed) ~= nil
+  c.allowed_roles = {}
+  for id in (c.ALLOWED_ROLE_IDS or ""):gmatch("%d+") do c.allowed_roles[id] = true end
+  c.outbound = (c.BOT_TOKEN or "") ~= "" and (c.CHANNEL_ID or "") ~= ""
+    and (next(c.allowed) ~= nil or next(c.allowed_roles) ~= nil)
   if c.outbound then
     if not c.BOT_TOKEN:match("^[%w%._%-]+$") then errs[#errs + 1] = "bot_token has unexpected characters" end
     if not c.CHANNEL_ID:match("^%d+$") then errs[#errs + 1] = "channel_id must be numeric" end
@@ -553,6 +556,40 @@ local function bot_react(c, mid, emoji, remove)
   local url = API .. "/channels/" .. c.CHANNEL_ID .. "/messages/" .. mid .. "/reactions/" .. urlenc(emoji) .. "/@me"
   if remove then return http("DELETE", url, nil, c.BOT_TOKEN) end
   return http("PUT", url, "", c.BOT_TOKEN)
+end
+
+-- ---------------------------------------------------------------- access
+
+-- allowed = listed user ID, or a member with one of the allowed roles
+local Access = { guild = nil, cache = {} }
+
+local function guild_id(c)
+  if not Access.guild then
+    local code, resp = http("GET", API .. "/channels/" .. c.CHANNEL_ID, nil, c.BOT_TOKEN)
+    local ok, ch = pcall(cjson.decode, resp)
+    if code == 200 and ok and type(ch) == "table" and ch.guild_id then Access.guild = tostring(ch.guild_id) end
+  end
+  return Access.guild
+end
+
+local function is_allowed(c, uid)
+  if c.allowed[uid] then return true end
+  if not next(c.allowed_roles) or not uid:match("^%d+$") then return false end
+  local now = os.time()
+  local hit = Access.cache[uid]
+  if hit and now - hit.t < 60 then return hit.ok end
+  local g = guild_id(c)
+  if not g then return false end
+  local code, resp = http("GET", API .. "/guilds/" .. g .. "/members/" .. uid, nil, c.BOT_TOKEN)
+  local ok, m = pcall(cjson.decode, resp)
+  local allowed = false
+  if code == 200 and ok and type(m) == "table" and type(m.roles) == "table" then
+    for _, r in ipairs(m.roles) do
+      if c.allowed_roles[tostring(r)] then allowed = true end
+    end
+  end
+  if code == 200 or code == 404 then Access.cache[uid] = { ok = allowed, t = now } end
+  return allowed
 end
 
 -- ---------------------------------------------------------------- inbound
@@ -791,7 +828,7 @@ function Outbound.poll_menus(c, now)
             local uok, users = pcall(cjson.decode, uresp)
             if ucode == 200 and uok and type(users) == "table" then
               for _, u in ipairs(users) do
-                if type(u) == "table" and c.allowed[tostring(u.id)] then done = name break end
+                if type(u) == "table" and is_allowed(c, tostring(u.id)) then done = name break end
               end
             end
           end
@@ -851,9 +888,9 @@ function Outbound.handle(c, paths, m, now)
   if cmd ~= "sms" and cmd ~= "otp" then return end
   local mid = tostring(m.id)
   local uid = m.author and tostring(m.author.id) or ""
-  if not c.allowed[uid] then
+  if not is_allowed(c, uid) then
     bot_react(c, mid, E_BLOCK)
-    log("warning", "ignored !" .. cmd .. " from a user not in ALLOWED_USER_IDS")
+    log("warning", "ignored !" .. cmd .. " from a user who is not allowed")
     return
   end
   if cmd == "otp" then return Outbound.otp(c, mid, content, now) end
@@ -1024,9 +1061,9 @@ function Relay.answer(c, it, now)
     return
   end
   local text, life = nil, 0
-  if not c.allowed[uid] then
+  if not is_allowed(c, uid) then
     text = E_BLOCK .. " You are not allowed to get codes."
-    log("warning", "ignored /otp from a user not in ALLOWED_USER_IDS")
+    log("warning", "ignored /otp from a user who is not allowed")
   elseif not c.otp[name] then
     text = "Unknown account. Available: `" .. table.concat(c.otp_names, "`, `") .. "`"
   elseif now < CLOCK_MIN then
@@ -1159,7 +1196,7 @@ local function save_config(c)
   if not cur:get(UCI_PKG, "main", "enabled") then cur:set(UCI_PKG, "main", "enabled", "1") end
   for k, opt in pairs(UCI_MAP) do
     local v = c[k] or ""
-    if opt == "allowed_user" then
+    if opt == "allowed_user" or opt == "allowed_role" then
       local ids = {}
       for id in v:gmatch("%d+") do ids[#ids + 1] = id end
       if #ids > 0 then cur:set(UCI_PKG, "main", opt, ids) else cur:delete(UCI_PKG, "main", opt) end
@@ -1309,6 +1346,7 @@ local function cmd_status(as_json)
     outbound = c.outbound,
     channel_id = c.CHANNEL_ID or "",
     allowed_users = c.ALLOWED_USER_IDS or "",
+    allowed_roles = c.ALLOWED_ROLE_IDS or "",
     seen = n,
     initialised = exists(SEEN_FILE),
     watching = p and table.concat(p.watch, " ") or "",
@@ -1341,6 +1379,27 @@ local function cmd_test()
   local code = post_webhook(c, "\240\159\167\170 sms2discord test message (" .. os.date("%Y-%m-%d %H:%M:%S") .. ")")
   print("Webhook: HTTP " .. code)
   os.exit((code >= 200 and code < 300) and 0 or 1)
+end
+
+-- server roles for the LuCI picker (JSON: [{id, name}])
+local function cmd_roles()
+  local c = load_config()
+  os.execute("mkdir -p " .. shq(RUN_DIR) .. " && chmod 700 " .. shq(RUN_DIR))
+  if (c.BOT_TOKEN or "") == "" or (c.CHANNEL_ID or "") == "" then print("[]") return end
+  local g = guild_id(c)
+  local code, resp = http("GET", API .. "/guilds/" .. (g or "0") .. "/roles", nil, c.BOT_TOKEN)
+  local ok, roles = pcall(cjson.decode, resp)
+  local out = {}
+  if g and code == 200 and ok and type(roles) == "table" then
+    table.sort(roles, function(a, b) return (tonumber(a.position) or 0) > (tonumber(b.position) or 0) end)
+    for _, r in ipairs(roles) do
+      -- skip @everyone and roles that belong to bots
+      if type(r) == "table" and tostring(r.id) ~= g and not r.managed then
+        out[#out + 1] = '{"id":' .. cjson.encode(tostring(r.id)) .. ',"name":' .. cjson.encode(tostring(r.name)) .. "}"
+      end
+    end
+  end
+  print("[" .. table.concat(out, ",") .. "]")
 end
 
 local function cmd_otp(name)
@@ -1440,8 +1499,9 @@ elseif cmd == "detect" then cmd_detect()
 elseif cmd == "migrate" then cmd_migrate()
 elseif cmd == "test" then cmd_test()
 elseif cmd == "otp" then cmd_otp(arg[2])
+elseif cmd == "roles" then cmd_roles()
 elseif cmd == "selftest" then cmd_selftest()
 else
-  print("Usage: sms2discord run|setup|set-bot|detect|migrate|status [--json]|test|otp NAME|selftest")
+  print("Usage: sms2discord run|setup|set-bot|detect|migrate|status [--json]|test|otp NAME|roles|selftest")
   os.exit(cmd and 1 or 0)
 end

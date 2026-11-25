@@ -4,6 +4,7 @@
 		"read": {
 			"file": {
 				"/usr/bin/sms2discord status --json": [ "exec" ],
+				"/usr/bin/sms2discord roles": [ "exec" ],
 				"/sbin/logread -e sms2discord": [ "exec" ]
 			},
 			"uci": [ "sms2discord" ]

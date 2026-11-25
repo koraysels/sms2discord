@@ -19,6 +19,13 @@ function getStatus() {
 	}).catch(function() { return null; });
 }
 
+function getRoles() {
+	return fs.exec(BIN, [ 'roles' ]).then(function(res) {
+		try { return JSON.parse(res.stdout) || []; }
+		catch (e) { return []; }
+	}).catch(function() { return []; });
+}
+
 function getLog() {
 	return fs.exec('/sbin/logread', [ '-e', 'sms2discord' ]).then(function(res) {
 		return (res.stdout || '').trim().split('\n').slice(-15).join('\n');
@@ -80,7 +87,7 @@ function yesNo(v, yes, no) {
 
 return view.extend({
 	load: function() {
-		return Promise.all([ uci.load('sms2discord'), getStatus(), getLog() ]);
+		return Promise.all([ uci.load('sms2discord'), getStatus(), getLog(), getRoles() ]);
 	},
 
 	renderStatusRows: function(st) {
@@ -213,8 +220,20 @@ return view.extend({
 		o = s.taboption('bot', form.Value, 'channel_id', _('Channel ID'), _('Channel the bot reads <code>!sms</code> commands from. Empty = the webhook\'s channel.'));
 		o.datatype = 'uinteger';
 
-		o = s.taboption('bot', form.DynamicList, 'allowed_user', _('Allowed Discord user IDs'), _('Only these users may use <code>!sms</code> and <code>!otp</code>. Empty = the bot\'s owner.'));
+		o = s.taboption('bot', form.DynamicList, 'allowed_user', _('Allowed Discord user IDs'), _('These users may use <code>!sms</code>, <code>!otp</code> and <code>/otp</code>. In Discord: <em>Settings → Advanced → Developer Mode</em>, then right-click a user → <em>Copy User ID</em>.'));
 		o.datatype = 'uinteger';
+
+		var roles = data[3] || [];
+		if (roles.length) {
+			o = s.taboption('bot', form.MultiValue, 'allowed_role', _('Allowed Discord roles'),
+				_('Everyone with one of these roles may use them too, so you can grant and revoke access in Discord itself. Create a role (e.g. <em>OTP</em>) under <em>Server Settings → Roles</em>.'));
+			roles.forEach(function(r) { o.value(r.id, r.name); });
+		}
+		else {
+			o = s.taboption('bot', form.DynamicList, 'allowed_role', _('Allowed Discord role IDs'),
+				_('Everyone with one of these roles may use them too. The role list appears here once the bot is connected.'));
+			o.datatype = 'uinteger';
+		}
 
 		o = s.taboption('bot', form.Button, '_detect', _('Detect channel and owner'),
 			_('Uses the saved settings: takes the channel from the webhook and your user ID from the bot\'s owner, then checks that the bot can read the channel.'));
