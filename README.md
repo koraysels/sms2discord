@@ -122,7 +122,7 @@ make package/sms2discord/compile package/luci-app-sms2discord/compile
 
 ![LuCI page: status, log, bot settings and authenticator accounts](docs/luci.jpg)
 
-The page shows live status and the log and has a *Send test message* button.
+The page shows live status and the log and has a *Send test message* button. After updating `luci-app-sms2discord`, reload the page with Cmd/Ctrl+Shift+R: browsers keep the old page script until then, because LuCI only versions it with the LuCI release.
 
 1. **Receiving:** in Discord, open your private channel → *Edit Channel → Integrations → Webhooks → New Webhook → Copy Webhook URL*. Paste it, then *Save & Apply*. Send an SMS to the router to test it.
 2. **Sending (optional):** create a dedicated bot:
